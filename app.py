@@ -4,6 +4,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, date, timedelta
 import hashlib
+from io import BytesIO
+
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import A6
+from reportlab.pdfgen import canvas
 
 st.set_page_config(page_title="Citas de Unidades", layout="wide")
 
@@ -102,14 +107,60 @@ def turnos_disponibles(df: pd.DataFrame, fecha_iso: str):
             disponibles.append((nombre, horario, restantes))
     return disponibles
 
+def pdf_ticket_bytes(row: dict) -> bytes:
+    """
+    Genera un PDF tamaño A6 (tipo ticket) en memoria y lo devuelve como bytes.
+    """
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A6)
+    w, h = A6
+
+    y = h - 20
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(14, y, "TICKET - Citas de Unidades")
+    y -= 18
+
+    c.setFont("Helvetica", 10)
+    lines = [
+        f"Ticket: {row['id_ticket']}",
+        f"Fecha: {row['fecha_cita']}",
+        f"Turno: {row['turno']} ({row['horario_turno']})",
+        f"Placa tracto: {row['placa_tracto']}",
+        f"Placa carreta: {row['placa_carreta']}",
+        f"Chofer: {row['chofer_nombre']}",
+        f"Tipo: {row['tipo_operacion']}",
+        f"Estado: {row['estado']}",
+        f"Creado: {row['creado_en']}",
+    ]
+    # Observación en 2 líneas si es larga
+    obs = row.get("observacion", "").strip()
+    if obs:
+        lines.append("Obs: " + (obs[:45]))
+        if len(obs) > 45:
+            lines.append("     " + obs[45:90])
+
+    for ln in lines:
+        c.drawString(14, y, ln)
+        y -= 14
+
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawString(14, 14, "Presentar este ticket al llegar.")
+    c.showPage()
+    c.save()
+
+    buf.seek(0)
+    return buf.read()
+
+# ====== UI ======
 st.title("🧾 Citas de Unidades (por turnos)")
 
-# Sidebar admin (solo si saben la clave)
 with st.sidebar:
     st.markdown("### 🔐 Admin")
     st.text_input("Contraseña admin", type="password", key="admin_pwd")
     if admin_ok():
         st.success("Admin activado")
+    else:
+        st.caption("Choferes: no usar.")
 
 ws = get_sheet()
 df = read_all(ws)
@@ -124,9 +175,22 @@ tab_objs = st.tabs(tabs)
 with tab_objs[0]:
     st.subheader("Registro (Chofer)")
 
+    # Semana Lunes a Sábado
     hoy = date.today()
-    max_fecha = hoy + timedelta(days=6)
-    fecha = st.date_input("Fecha (esta semana)", min_value=hoy, max_value=max_fecha, value=hoy)
+    lunes = hoy - timedelta(days=hoy.weekday())       # Monday = 0
+    sabado = lunes + timedelta(days=5)               # Saturday
+
+    # si hoy ya pasó sábado (caso raro), igual dejamos rango de esta semana
+    if hoy > sabado:
+        lunes = hoy
+        sabado = hoy
+
+    fecha = st.date_input(
+        "Fecha (Semana Lunes–Sábado)",
+        min_value=lunes,
+        max_value=sabado,
+        value=hoy if (hoy >= lunes and hoy <= sabado) else lunes
+    )
     fecha_iso = fecha.isoformat()
 
     disp = turnos_disponibles(df, fecha_iso)
@@ -154,6 +218,7 @@ with tab_objs[0]:
             if not placa_tracto.strip() or not chofer.strip():
                 st.error("Placa tracto y chofer son obligatorios.")
             else:
+                # recalcular para evitar choques
                 df2 = read_all(ws)
                 disp2 = turnos_disponibles(df2, fecha_iso)
                 ok_turno = [d for d in disp2 if d[0] == turno_sel]
@@ -178,23 +243,16 @@ with tab_objs[0]:
                     }
                     append_row(ws, row)
 
-                    resumen = (
-                        "TICKET - Citas de Unidades\n"
-                        "=========================\n"
-                        f"Ticket: {ticket}\n"
-                        f"Fecha: {fecha_iso}\n"
-                        f"Turno: {turno_sel} ({horario_sel})\n"
-                        f"Placa tracto: {row['placa_tracto']}\n"
-                        f"Placa carreta: {row['placa_carreta']}\n"
-                        f"Chofer: {row['chofer_nombre']}\n"
-                        f"Tipo operación: {row['tipo_operacion']}\n"
-                        f"Obs: {row['observacion']}\n"
-                        f"Estado: {row['estado']}\n"
-                        f"Creado: {row['creado_en']}\n"
-                    )
+                    st.success(f"✅ Ticket creado: {ticket}")
 
-                    st.success(f"✅ Listo. Ticket creado: {ticket}")
-                    st.download_button("⬇️ Descargar ticket (.txt)", resumen, file_name=f"{ticket}.txt", mime="text/plain")
+                    # PDF descargable
+                    pdf_bytes = pdf_ticket_bytes(row)
+                    st.download_button(
+                        "⬇️ Descargar ticket (PDF)",
+                        pdf_bytes,
+                        file_name=f"{ticket}.pdf",
+                        mime="application/pdf",
+                    )
 
 # ===== TAB ADMIN =====
 if admin_ok():
@@ -203,9 +261,10 @@ if admin_ok():
 
         df = read_all(ws)
 
+        # filtros
         c1, c2, c3 = st.columns(3)
         with c1:
-            f_fecha = st.date_input("Filtrar fecha", value=None)
+            f_fecha = st.date_input("Filtrar fecha (opcional)", value=None)
         with c2:
             f_estado = st.selectbox("Filtrar estado", ["(Todos)"] + ESTADOS)
         with c3:
@@ -220,6 +279,48 @@ if admin_ok():
             dff = dff[dff["turno"].astype(str) == f_turno]
 
         st.dataframe(dff.sort_values(["fecha_cita", "turno"]), use_container_width=True, height=420)
+
+        # Descargar reporte CSV (filtrado)
+        csv_bytes = dff.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar reporte (CSV)",
+            csv_bytes,
+            file_name="reporte_citas.csv",
+            mime="text/csv",
+        )
+
+        st.markdown("### 📈 Gráficos")
+
+        # asegurar fecha como fecha
+        df_plot = df.copy()
+        df_plot["fecha_cita"] = pd.to_datetime(df_plot["fecha_cita"], errors="coerce").dt.date
+
+        # atendidos por día
+        atendidos = df_plot[df_plot["estado"].astype(str) == "ATENDIDO"]
+        if atendidos.empty:
+            st.info("Todavía no hay unidades ATENDIDAS para graficar.")
+        else:
+            por_dia = atendidos.groupby("fecha_cita").size().sort_index()
+
+            fig = plt.figure()
+            plt.plot(por_dia.index, por_dia.values, marker="o")
+            plt.xticks(rotation=45)
+            plt.title("Unidades ATENDIDAS por día")
+            plt.xlabel("Fecha")
+            plt.ylabel("Cantidad")
+            st.pyplot(fig)
+
+            # atendidos por semana (semana ISO)
+            atendidos_dt = pd.to_datetime(atendidos["fecha_cita"])
+            semana = atendidos_dt.dt.isocalendar().week
+            por_semana = semana.value_counts().sort_index()
+
+            fig2 = plt.figure()
+            plt.bar(por_semana.index.astype(str), por_semana.values)
+            plt.title("Unidades ATENDIDAS por semana (ISO)")
+            plt.xlabel("Semana")
+            plt.ylabel("Cantidad")
+            st.pyplot(fig2)
 
         st.markdown("### Cambiar estado por Ticket")
         ticket = st.text_input("ID Ticket (ej: TKT-XXXXXXXX)")
