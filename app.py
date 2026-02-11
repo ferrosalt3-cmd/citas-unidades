@@ -4,26 +4,32 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, date, timedelta
 import hashlib
-import io
+from io import BytesIO
+
+import altair as alt
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
 
 # -----------------------------
-# CONFIG
+# Config
 # -----------------------------
 st.set_page_config(page_title="Citas de Unidades (por turnos)", layout="wide")
 
 WORKSHEET_NAME = "citas"
+
 ESTADOS = ["EN COLA", "EN PROCESO", "ATENDIDO", "CANCELADO"]
 TIPOS_OPERACION = ["Carga", "Descarga", "Importacion", "Exportacion"]
 
-# Turnos fijos (puedes editar aquí)
+# Turnos fijos (edítalos aquí si cambian)
 TURNOS = [
-    {"turno": "Turno 1", "horario": "08:00 - 10:00", "cupos": 4},
-    {"turno": "Turno 2", "horario": "10:00 - 12:00", "cupos": 4},
-    {"turno": "Turno 3", "horario": "13:00 - 15:00", "cupos": 4},
-    {"turno": "Turno 4", "horario": "15:00 - 16:30", "cupos": 4},
+    {"turno": "Turno 1", "horario": "08:00 - 10:00"},
+    {"turno": "Turno 2", "horario": "10:00 - 12:00"},
+    {"turno": "Turno 3", "horario": "13:00 - 15:00"},
+    {"turno": "Turno 4", "horario": "15:00 - 16:30"},
 ]
+CUPOS_POR_TURNO = 4
 
-# Columnas esperadas en Google Sheet
 COLUMNAS = [
     "id_ticket",
     "turno",
@@ -43,7 +49,7 @@ COLUMNAS = [
 
 
 # -----------------------------
-# GOOGLE SHEETS
+# Google Sheets
 # -----------------------------
 @st.cache_resource
 def get_client():
@@ -52,10 +58,11 @@ def get_client():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
+
 def get_sheet():
     sheet_id = st.secrets.get("SHEET_ID")
     if not sheet_id:
-        raise RuntimeError("Falta SHEET_ID en Secrets.")
+        raise RuntimeError("Falta SHEET_ID en Secrets (fuera de [gcp_service_account]).")
 
     gc = get_client()
     sh = gc.open_by_key(sheet_id)
@@ -63,103 +70,183 @@ def get_sheet():
     ensure_columns(ws)
     return ws
 
+
 def ensure_columns(ws):
     headers = ws.row_values(1)
     if not headers:
         ws.append_row(COLUMNAS)
         return
-    # si faltan columnas, agregarlas
+
+    # si faltan columnas, las agregamos al final
     missing = [c for c in COLUMNAS if c not in headers]
     if missing:
         new_headers = headers + missing
         ws.update("1:1", [new_headers])
 
+
 def read_all(ws) -> pd.DataFrame:
-    data = ws.get_all_records()
-    df = pd.DataFrame(data)
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows)
     if df.empty:
         df = pd.DataFrame(columns=COLUMNAS)
+
     # asegurar columnas
     for c in COLUMNAS:
         if c not in df.columns:
             df[c] = ""
+
+    # parse fechas
+    if "fecha_cita" in df.columns:
+        df["fecha_cita_dt"] = pd.to_datetime(df["fecha_cita"], errors="coerce").dt.date
+    else:
+        df["fecha_cita_dt"] = pd.NaT
+
     return df
 
-def add_row(ws, data: dict):
+
+def append_row(ws, data: dict):
     headers = ws.row_values(1)
     row = [data.get(h, "") for h in headers]
-    ws.append_row(row)
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
-def update_estado_by_ticket(ws, ticket_id: str, nuevo_estado: str):
+
+def update_estado_by_ticket(ws, ticket_id: str, nuevo_estado: str) -> bool:
+    # Busca ticket en la columna A (id_ticket)
+    try:
+        cell = ws.find(ticket_id)
+        row_idx = cell.row
+    except Exception:
+        return False
+
+    headers = ws.row_values(1)
+    if "estado" not in headers:
+        return False
+
+    col_estado = headers.index("estado") + 1
+    ws.update_cell(row_idx, col_estado, nuevo_estado)
+    return True
+
+
+def update_estado_batch(ws, cambios: dict):
+    """
+    cambios: {ticket_id: nuevo_estado}
+    """
+    if not cambios:
+        return
+
     headers = ws.row_values(1)
     col_estado = headers.index("estado") + 1
 
-    cell = ws.find(ticket_id)
-    ws.update_cell(cell.row, col_estado, nuevo_estado)
+    # mapeo ticket->fila
+    all_ids = ws.col_values(1)  # id_ticket columna A
+    id_to_row = {}
+    for i, val in enumerate(all_ids, start=1):
+        if val and val != "id_ticket":
+            id_to_row[val] = i
 
+    updates = []
+    for tid, est in cambios.items():
+        r = id_to_row.get(tid)
+        if r:
+            updates.append({"range": gspread.utils.rowcol_to_a1(r, col_estado), "values": [[est]]})
+
+    if updates:
+        ws.batch_update(updates)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def generar_ticket():
     return "TKT-" + hashlib.sha1(str(datetime.now()).encode()).hexdigest()[:8].upper()
 
 
-# -----------------------------
-# FECHAS (SEMANA LUNES-SÁBADO)
-# -----------------------------
-def get_monday(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-def is_monday_to_saturday(d: date) -> bool:
-    return 0 <= d.weekday() <= 5  # 0=Lunes, 5=Sábado
+def semana_lunes_sabado(fecha: date):
+    # lunes = 0
+    lunes = fecha - timedelta(days=fecha.weekday())
+    sabado = lunes + timedelta(days=5)
+    return lunes, sabado
 
 
-# -----------------------------
-# CUPOS POR TURNO
-# -----------------------------
-def cupos_disponibles(df: pd.DataFrame, fecha: date, turno: str) -> int:
-    if df.empty:
-        usados = 0
-    else:
-        usados = df[
-            (df["fecha_cita"] == str(fecha)) &
-            (df["turno"] == turno) &
-            (df["estado"] != "CANCELADO")
-        ].shape[0]
+def cupos_disponibles(df: pd.DataFrame, fecha: date):
+    # cuenta cuántos registros ya hay por turno en esa fecha (excepto cancelados si quieres permitir reuso)
+    dfd = df[df["fecha_cita_dt"] == fecha].copy()
+    # si quieres que CANCELADO libere cupo, descomenta:
+    dfd = dfd[dfd["estado"] != "CANCELADO"]
 
-    cupos_total = next(t["cupos"] for t in TURNOS if t["turno"] == turno)
-    return max(cupos_total - usados, 0)
-
-def turnos_para_fecha(df: pd.DataFrame, fecha: date):
-    opciones = []
+    usados = dfd.groupby("turno")["id_ticket"].count().to_dict()
+    disponibles = []
     for t in TURNOS:
-        disp = cupos_disponibles(df, fecha, t["turno"])
-        if disp > 0:
-            opciones.append(f'{t["turno"]} ({t["horario"]}) — Cupos: {disp}')
-    return opciones
-
-def parse_turno_label(label: str):
-    # "Turno 1 (08:00 - 10:00) — Cupos: 3"
-    turno = label.split(" (")[0].strip()
-    horario = label.split("(")[1].split(")")[0].strip()
-    return turno, horario
+        turno = t["turno"]
+        usados_turno = int(usados.get(turno, 0))
+        disp = max(CUPOS_POR_TURNO - usados_turno, 0)
+        disponibles.append({"turno": turno, "horario": t["horario"], "disponibles": disp})
+    return disponibles
 
 
-# -----------------------------
-# ADMIN
-# -----------------------------
+def build_ticket_pdf(ticket_data: dict) -> bytes:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+
+    y = height - 60
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(60, y, "TICKET DE CITA - UNIDADES")
+    y -= 30
+
+    c.setFont("Helvetica", 12)
+    items = [
+        ("Ticket", ticket_data.get("id_ticket", "")),
+        ("Fecha", ticket_data.get("fecha_cita", "")),
+        ("Turno", f'{ticket_data.get("turno","")} ({ticket_data.get("horario_turno","")})'),
+        ("Placa tracto", ticket_data.get("placa_tracto", "")),
+        ("Placa carreta", ticket_data.get("placa_carreta", "")),
+        ("Chofer", ticket_data.get("chofer_nombre", "")),
+        ("Licencia", ticket_data.get("licencia", "")),
+        ("Transporte", ticket_data.get("transporte", "")),
+        ("Operación", ticket_data.get("tipo_operacion", "")),
+        ("Estado", ticket_data.get("estado", "")),
+        ("Creado", ticket_data.get("creado_en", "")),
+    ]
+
+    for k, v in items:
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(60, y, f"{k}:")
+        c.setFont("Helvetica", 11)
+        c.drawString(170, y, str(v))
+        y -= 18
+        if y < 80:
+            c.showPage()
+            y = height - 60
+
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawString(60, 60, "Presentar este ticket al llegar a la instalación.")
+    c.save()
+    return buffer.getvalue()
+
+
 def admin_ok() -> bool:
-    admin_pass = st.secrets.get("ADMIN_PASSWORD", "")
-    if not admin_pass:
-        st.info("Admin sin contraseña configurada en Secrets (ADMIN_PASSWORD).")
-        return True
+    admin_pw = st.secrets.get("ADMIN_PASSWORD", "")
+    if not admin_pw:
+        st.sidebar.warning("Falta ADMIN_PASSWORD en Secrets.")
+        return False
 
-    entered = st.sidebar.text_input("Contraseña admin", type="password")
-    if entered and entered == admin_pass:
+    pw = st.sidebar.text_input("Contraseña admin", type="password")
+    if not pw:
+        st.sidebar.caption("Choferes: no usar.")
+        return False
+    if pw == admin_pw:
         st.sidebar.success("Admin activado")
         return True
-
-    if entered and entered != admin_pass:
-        st.sidebar.error("Contraseña incorrecta")
-
+    st.sidebar.error("Clave incorrecta")
     return False
+
+
+def export_excel(df: pd.DataFrame) -> bytes:
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="reporte")
+    return out.getvalue()
 
 
 # -----------------------------
@@ -170,26 +257,24 @@ st.title("🧾 Citas de Unidades (por turnos)")
 ws = get_sheet()
 df = read_all(ws)
 
-# Sidebar
-st.sidebar.markdown("### 🔐 Admin")
-is_admin = admin_ok()
+# Tabs: Chofer siempre / Admin solo si clave correcta
+admin_enabled = admin_ok()
 
-# Tabs: chofer siempre; admin solo si ok
-tabs = ["🧑‍✈️ Registrar cita"]
-if is_admin:
-    tabs.append("📊 Panel admin")
+tabs = ["🧍 Registrar cita"]
+if admin_enabled:
+    tabs.append("🛠 Panel admin")
+    tabs.append("📊 Dashboard gerencia")
 
-selected_tab = st.tabs(tabs)
+tab_objs = st.tabs(tabs)
 
 # -----------------------------
-# TAB CHOFER
+# TAB 1: Registro Chofer
 # -----------------------------
-with selected_tab[0]:
+with tab_objs[0]:
     st.subheader("Registro (Chofer)")
 
     hoy = date.today()
-    lunes = get_monday(hoy)
-    sabado = lunes + timedelta(days=5)
+    lunes, sabado = semana_lunes_sabado(hoy)
 
     fecha = st.date_input(
         "Fecha (Semana Lunes–Sábado)",
@@ -198,52 +283,49 @@ with selected_tab[0]:
         max_value=sabado,
     )
 
-    if not is_monday_to_saturday(fecha):
-        st.error("Solo se permite agendar de Lunes a Sábado.")
+    # recalcular semana según fecha elegida
+    lunes, sabado = semana_lunes_sabado(fecha)
+
+    disp = cupos_disponibles(df, fecha)
+    opciones = []
+    for d in disp:
+        if d["disponibles"] > 0:
+            opciones.append(f'{d["turno"]} ({d["horario"]}) — Cupos: {d["disponibles"]}')
+
+    if not opciones:
+        st.error("No hay cupos disponibles para esa fecha. Prueba otra fecha/turno.")
         st.stop()
 
-    opciones_turno = turnos_para_fecha(df, fecha)
+    sel = st.selectbox("Selecciona turno disponible", opciones)
 
-    if not opciones_turno:
-        st.warning("No hay cupos disponibles para esa fecha. Elige otro día.")
-        st.stop()
-
-    turno_label = st.selectbox("Selecciona turno disponible", opciones_turno)
-    turno, horario_turno = parse_turno_label(turno_label)
+    # Parse turno/horario
+    turno_sel = sel.split(" (")[0].strip()
+    horario_sel = sel.split("(")[1].split(")")[0].strip()
 
     col1, col2 = st.columns(2)
-
     with col1:
         placa_tracto = st.text_input("Placa tracto *")
         placa_carreta = st.text_input("Placa carreta")
         chofer = st.text_input("Chofer *")
         licencia = st.text_input("Licencia")
-
     with col2:
         transporte = st.text_input("Transporte")
         tipo = st.selectbox("Tipo de operación", TIPOS_OPERACION)
         obs = st.text_area("Observación")
 
-    # Mostrar cupos restantes
-    disp = cupos_disponibles(df, fecha, turno)
-    st.info(f"✅ Quedan {disp} cupos en {turno} ({horario_turno}) para {fecha}")
+    # info cupos
+    disp_map = {d["turno"]: d["disponibles"] for d in disp}
+    st.info(f"✅ Quedan **{disp_map.get(turno_sel, 0)} cupos** en **{turno_sel} ({horario_sel})** para **{fecha}**")
 
     if st.button("✅ Generar ticket y registrar"):
         if not placa_tracto or not chofer:
-            st.error("Placa tracto y chofer son obligatorios.")
+            st.error("Placa tracto y chofer son obligatorios")
         else:
-            # revalidar cupos justo antes de registrar
-            df_refresh = read_all(ws)
-            disp2 = cupos_disponibles(df_refresh, fecha, turno)
-            if disp2 <= 0:
-                st.error("Lo sentimos: ese turno se llenó. Selecciona otro.")
-                st.stop()
-
             ticket = generar_ticket()
             data = {
                 "id_ticket": ticket,
-                "turno": turno,
-                "horario_turno": horario_turno,
+                "turno": turno_sel,
+                "horario_turno": horario_sel,
                 "placa_tracto": placa_tracto.strip().upper(),
                 "placa_carreta": placa_carreta.strip().upper(),
                 "chofer_nombre": chofer.strip(),
@@ -251,157 +333,236 @@ with selected_tab[0]:
                 "transporte": transporte.strip(),
                 "tipo_operacion": tipo,
                 "fecha_cita": str(fecha),
-                # hora_cita: guardamos el inicio del turno como referencia
-                "hora_cita": horario_turno.split("-")[0].strip(),
+                "hora_cita": "",  # no se usa (turnos mandan)
                 "observacion": obs.strip(),
                 "estado": "EN COLA",
                 "creado_en": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
+            append_row(ws, data)
 
-            add_row(ws, data)
             st.success(f"🎫 Ticket creado: {ticket}")
+
+            # Mostrar ticket
             st.code(
-                f"""TICKET: {ticket}
-FECHA: {fecha}
-TURNO: {turno} ({horario_turno})
-PLACA TRACTO: {data["placa_tracto"]}
-PLACA CARRETA: {data["placa_carreta"]}
-CHOFER: {data["chofer_nombre"]}
-OPERACIÓN: {tipo}
-ESTADO: EN COLA
-""",
-                language="text",
+                "\n".join(
+                    [
+                        f"TICKET: {ticket}",
+                        f"FECHA: {fecha}",
+                        f"TURNO: {turno_sel} ({horario_sel})",
+                        f"PLACA TRACTO: {data['placa_tracto']}",
+                        f"PLACA CARRETA: {data['placa_carreta']}",
+                        f"CHOFER: {data['chofer_nombre']}",
+                        f"OPERACIÓN: {data['tipo_operacion']}",
+                        f"ESTADO: {data['estado']}",
+                    ]
+                )
             )
 
-            st.info("📌 El ticket se muestra en pantalla. Si deseas PDF/QR, lo agregamos luego.")
+            pdf_bytes = build_ticket_pdf(data)
+            st.download_button(
+                "⬇️ Descargar ticket (PDF)",
+                data=pdf_bytes,
+                file_name=f"{ticket}.pdf",
+                mime="application/pdf",
+            )
 
+            st.caption("💡 Guarda este PDF y preséntalo al llegar.")
 
 # -----------------------------
-# TAB ADMIN
+# TAB 2: Panel Admin
 # -----------------------------
-if is_admin:
-    with selected_tab[1]:
+if admin_enabled:
+    with tab_objs[1]:
         st.subheader("Panel de control (Admin)")
 
-        # Recargar datos
+        # Recargar (por si ya registraron)
+        ws = get_sheet()
         df = read_all(ws)
 
-        # Convertir fecha
-        if not df.empty and "fecha_cita" in df.columns:
-            df["fecha_cita"] = pd.to_datetime(df["fecha_cita"], errors="coerce")
+        # Filtros básicos
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            fecha_f = st.date_input("Filtrar fecha", value=date.today())
+        with c2:
+            estado_f = st.selectbox("Filtrar estado", ["(Todos)"] + ESTADOS, index=0)
+        with c3:
+            turno_f = st.selectbox("Filtrar turno", ["(Todos)"] + [t["turno"] for t in TURNOS], index=0)
 
-        # ---------- KPI ----------
-        st.markdown("### Resumen rápido")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("EN COLA", int((df["estado"] == "EN COLA").sum()) if not df.empty else 0)
-        c2.metric("EN PROCESO", int((df["estado"] == "EN PROCESO").sum()) if not df.empty else 0)
-        c3.metric("ATENDIDO", int((df["estado"] == "ATENDIDO").sum()) if not df.empty else 0)
-        c4.metric("CANCELADO", int((df["estado"] == "CANCELADO").sum()) if not df.empty else 0)
+        dff = df.copy()
+        dff = dff[dff["fecha_cita_dt"] == fecha_f]
+        if estado_f != "(Todos)":
+            dff = dff[dff["estado"] == estado_f]
+        if turno_f != "(Todos)":
+            dff = dff[dff["turno"] == turno_f]
 
-        st.divider()
+        st.markdown("### Gestión rápida (cambiar estado sin escribir ticket)")
+        st.caption("Edita la columna **estado** y luego presiona **Guardar cambios**.")
 
-        # ---------- Filtros ----------
-        st.markdown("### Filtros")
-        f1, f2, f3 = st.columns(3)
+        show_cols = [
+            "id_ticket", "turno", "horario_turno",
+            "placa_tracto", "placa_carreta", "chofer_nombre",
+            "licencia", "transporte", "tipo_operacion",
+            "fecha_cita", "observacion", "estado", "creado_en"
+        ]
 
-        with f1:
-            filtro_fecha = st.date_input("Filtrar fecha", value=None)
+        dff_show = dff[show_cols].copy()
 
-        with f2:
-            filtro_estado = st.selectbox("Filtrar estado", ["(Todos)"] + ESTADOS, index=0)
-
-        with f3:
-            filtro_turno = st.selectbox("Filtrar turno", ["(Todos)"] + [t["turno"] for t in TURNOS], index=0)
-
-        df_view = df.copy()
-
-        if filtro_fecha:
-            df_view = df_view[df_view["fecha_cita"].dt.date == filtro_fecha]
-
-        if filtro_estado != "(Todos)":
-            df_view = df_view[df_view["estado"] == filtro_estado]
-
-        if filtro_turno != "(Todos)":
-            df_view = df_view[df_view["turno"] == filtro_turno]
-
-        # ---------- Tabla editable (solo estado) ----------
-        st.markdown("### Gestión rápida (cambiar estado con click)")
-
-        # Para editar, necesitamos fecha como string para no romper el editor
-        df_edit = df_view.copy()
-        if "fecha_cita" in df_edit.columns:
-            df_edit["fecha_cita"] = df_edit["fecha_cita"].dt.strftime("%Y-%m-%d")
-
-        edited_df = st.data_editor(
-            df_edit,
+        edited = st.data_editor(
+            dff_show,
+            use_container_width=True,
+            hide_index=True,
             column_config={
                 "estado": st.column_config.SelectboxColumn(
-                    "Estado",
+                    "estado",
                     options=ESTADOS,
                     required=True,
                 )
             },
-            disabled=[c for c in df_edit.columns if c != "estado"],
-            use_container_width=True,
-            hide_index=True,
-            key="editor_estados",
+            disabled=[c for c in dff_show.columns if c != "estado"],
+            key="admin_editor",
         )
 
-        if st.button("💾 Guardar cambios de estado"):
-            try:
-                for _, row in edited_df.iterrows():
-                    update_estado_by_ticket(ws, row["id_ticket"], row["estado"])
-                st.success("✅ Estados actualizados correctamente")
-            except Exception as e:
-                st.error("Error guardando estados. Revisa si el ticket existe.")
-                st.exception(e)
+        if st.button("💾 Guardar cambios"):
+            # Detectar cambios estado
+            cambios = {}
+            original = dff_show.set_index("id_ticket")["estado"].to_dict()
+            nuevo = edited.set_index("id_ticket")["estado"].to_dict()
+            for tid, est_new in nuevo.items():
+                if original.get(tid) != est_new:
+                    cambios[tid] = est_new
 
-        st.divider()
+            update_estado_batch(ws, cambios)
 
-        # ---------- Dashboard / Gráficos ----------
-        st.markdown("### Dashboard (para gerencia)")
+            if cambios:
+                st.success(f"✅ Cambios guardados: {len(cambios)}")
+            else:
+                st.info("No hubo cambios.")
+            st.rerun()
 
-        # A) Estado actual (barras)
-        st.markdown("**Estado actual (cantidad)**")
-        if df.empty:
-            st.info("Aún no hay registros.")
+# -----------------------------
+# TAB 3: Dashboard Gerencia
+# -----------------------------
+if admin_enabled:
+    with tab_objs[2]:
+        st.subheader("Dashboard (para gerencia)")
+
+        ws = get_sheet()
+        df = read_all(ws).copy()
+
+        # Elegir semana (lunes-sábado)
+        base = st.date_input("Semana (elige un día)", value=date.today())
+        lunes, sabado = semana_lunes_sabado(base)
+
+        dfw = df[(df["fecha_cita_dt"] >= lunes) & (df["fecha_cita_dt"] <= sabado)].copy()
+
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total semana", int(len(dfw)))
+        k2.metric("EN COLA", int((dfw["estado"] == "EN COLA").sum()))
+        k3.metric("EN PROCESO", int((dfw["estado"] == "EN PROCESO").sum()))
+        k4.metric("ATENDIDO", int((dfw["estado"] == "ATENDIDO").sum()))
+
+        st.markdown("### Distribución por estado (semana)")
+        estado_counts = (
+            dfw.groupby("estado")["id_ticket"].count().reindex(ESTADOS, fill_value=0).reset_index()
+        )
+        estado_counts.columns = ["estado", "cantidad"]
+
+        chart_estado = (
+            alt.Chart(estado_counts)
+            .mark_bar()
+            .encode(
+                x=alt.X("estado:N", title="Estado"),
+                y=alt.Y("cantidad:Q", title="Cantidad"),
+                tooltip=["estado", "cantidad"],
+            )
+        )
+
+        text_estado = (
+            alt.Chart(estado_counts)
+            .mark_text(dy=-8)
+            .encode(x="estado:N", y="cantidad:Q", text="cantidad:Q")
+        )
+
+        st.altair_chart((chart_estado + text_estado).properties(height=320), use_container_width=True)
+
+        st.markdown("### Unidades por día (semana Lunes–Sábado)")
+        if dfw["fecha_cita_dt"].notna().any():
+            by_day = dfw.groupby("fecha_cita_dt")["id_ticket"].count().reset_index()
+            by_day.columns = ["fecha", "cantidad"]
+            by_day["fecha"] = by_day["fecha"].astype(str)
+
+            chart_day = (
+                alt.Chart(by_day)
+                .mark_bar()
+                .encode(
+                    x=alt.X("fecha:N", title="Día", sort=None),
+                    y=alt.Y("cantidad:Q", title="Cantidad"),
+                    tooltip=["fecha", "cantidad"],
+                )
+            )
+            text_day = (
+                alt.Chart(by_day)
+                .mark_text(dy=-8)
+                .encode(x="fecha:N", y="cantidad:Q", text="cantidad:Q")
+            )
+
+            st.altair_chart((chart_day + text_day).properties(height=320), use_container_width=True)
         else:
-            estado_count = df["estado"].value_counts().reindex(ESTADOS, fill_value=0)
-            st.bar_chart(estado_count)
+            st.info("Aún no hay datos de fechas para esa semana.")
 
-        # B) Unidades por día (semana Lunes–Sábado)
-        st.markdown("**Unidades por día (Lunes–Sábado)**")
-        if not df.empty and df["fecha_cita"].notna().any():
-            df2 = df.copy()
-            df2 = df2[df2["fecha_cita"].notna()]
-            df2 = df2[(df2["fecha_cita"].dt.weekday >= 0) & (df2["fecha_cita"].dt.weekday <= 5)]
-            por_dia = df2.groupby(df2["fecha_cita"].dt.date).size()
-            st.line_chart(por_dia)
-        else:
-            st.info("Sin fechas válidas para graficar.")
+        st.markdown("### Ocupación por turno (semana)")
+        by_turno = dfw.groupby("turno")["id_ticket"].count().reindex([t["turno"] for t in TURNOS], fill_value=0).reset_index()
+        by_turno.columns = ["turno", "cantidad"]
 
-        # C) Ocupación por turno
-        st.markdown("**Ocupación por turno**")
-        if not df.empty:
-            turnos_count = df.groupby("turno").size()
-            st.bar_chart(turnos_count)
+        chart_turno = (
+            alt.Chart(by_turno)
+            .mark_bar()
+            .encode(
+                x=alt.X("turno:N", title="Turno", sort=None),
+                y=alt.Y("cantidad:Q", title="Cantidad"),
+                tooltip=["turno", "cantidad"],
+            )
+        )
+        text_turno = (
+            alt.Chart(by_turno)
+            .mark_text(dy=-8)
+            .encode(x="turno:N", y="cantidad:Q", text="cantidad:Q")
+        )
+        st.altair_chart((chart_turno + text_turno).properties(height=320), use_container_width=True)
 
-        st.divider()
+        st.markdown("### Operación (semana)")
+        by_op = dfw.groupby("tipo_operacion")["id_ticket"].count().reset_index()
+        by_op.columns = ["operacion", "cantidad"]
 
-        # ---------- Descargar reporte Excel ----------
-        st.markdown("### 📥 Descargar reporte (Excel)")
+        chart_op = (
+            alt.Chart(by_op)
+            .mark_bar()
+            .encode(
+                x=alt.X("operacion:N", title="Operación"),
+                y=alt.Y("cantidad:Q", title="Cantidad"),
+                tooltip=["operacion", "cantidad"],
+            )
+        )
+        text_op = (
+            alt.Chart(by_op)
+            .mark_text(dy=-8)
+            .encode(x="operacion:N", y="cantidad:Q", text="cantidad:Q")
+        )
+        st.altair_chart((chart_op + text_op).properties(height=320), use_container_width=True)
 
-        df_export = df.copy()
-        if "fecha_cita" in df_export.columns:
-            df_export["fecha_cita"] = pd.to_datetime(df_export["fecha_cita"], errors="coerce").dt.strftime("%Y-%m-%d")
-
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df_export.to_excel(writer, index=False, sheet_name="Citas")
+        st.markdown("### Descargar reporte (Excel)")
+        reporte_cols = [
+            "id_ticket", "fecha_cita", "turno", "horario_turno", "estado",
+            "placa_tracto", "placa_carreta", "chofer_nombre", "licencia",
+            "transporte", "tipo_operacion", "observacion", "creado_en"
+        ]
+        reporte = dfw[reporte_cols].copy()
+        excel_bytes = export_excel(reporte)
 
         st.download_button(
-            label="📊 Descargar reporte .xlsx",
-            data=buffer.getvalue(),
-            file_name="reporte_citas.xlsx",
+            "⬇️ Descargar reporte (.xlsx)",
+            data=excel_bytes,
+            file_name=f"reporte_citas_{lunes}_a_{sabado}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
