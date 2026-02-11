@@ -108,9 +108,6 @@ def turnos_disponibles(df: pd.DataFrame, fecha_iso: str):
     return disponibles
 
 def pdf_ticket_bytes(row: dict) -> bytes:
-    """
-    Genera un PDF tamaño A6 (tipo ticket) en memoria y lo devuelve como bytes.
-    """
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A6)
     w, h = A6
@@ -132,7 +129,6 @@ def pdf_ticket_bytes(row: dict) -> bytes:
         f"Estado: {row['estado']}",
         f"Creado: {row['creado_en']}",
     ]
-    # Observación en 2 líneas si es larga
     obs = row.get("observacion", "").strip()
     if obs:
         lines.append("Obs: " + (obs[:45]))
@@ -151,7 +147,6 @@ def pdf_ticket_bytes(row: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# ====== UI ======
 st.title("🧾 Citas de Unidades (por turnos)")
 
 with st.sidebar:
@@ -175,21 +170,15 @@ tab_objs = st.tabs(tabs)
 with tab_objs[0]:
     st.subheader("Registro (Chofer)")
 
-    # Semana Lunes a Sábado
     hoy = date.today()
-    lunes = hoy - timedelta(days=hoy.weekday())       # Monday = 0
-    sabado = lunes + timedelta(days=5)               # Saturday
-
-    # si hoy ya pasó sábado (caso raro), igual dejamos rango de esta semana
-    if hoy > sabado:
-        lunes = hoy
-        sabado = hoy
+    lunes = hoy - timedelta(days=hoy.weekday())
+    sabado = lunes + timedelta(days=5)
 
     fecha = st.date_input(
         "Fecha (Semana Lunes–Sábado)",
         min_value=lunes,
         max_value=sabado,
-        value=hoy if (hoy >= lunes and hoy <= sabado) else lunes
+        value=hoy if (lunes <= hoy <= sabado) else lunes
     )
     fecha_iso = fecha.isoformat()
 
@@ -218,7 +207,6 @@ with tab_objs[0]:
             if not placa_tracto.strip() or not chofer.strip():
                 st.error("Placa tracto y chofer son obligatorios.")
             else:
-                # recalcular para evitar choques
                 df2 = read_all(ws)
                 disp2 = turnos_disponibles(df2, fecha_iso)
                 ok_turno = [d for d in disp2 if d[0] == turno_sel]
@@ -244,8 +232,6 @@ with tab_objs[0]:
                     append_row(ws, row)
 
                     st.success(f"✅ Ticket creado: {ticket}")
-
-                    # PDF descargable
                     pdf_bytes = pdf_ticket_bytes(row)
                     st.download_button(
                         "⬇️ Descargar ticket (PDF)",
@@ -261,7 +247,6 @@ if admin_ok():
 
         df = read_all(ws)
 
-        # filtros
         c1, c2, c3 = st.columns(3)
         with c1:
             f_fecha = st.date_input("Filtrar fecha (opcional)", value=None)
@@ -280,7 +265,6 @@ if admin_ok():
 
         st.dataframe(dff.sort_values(["fecha_cita", "turno"]), use_container_width=True, height=420)
 
-        # Descargar reporte CSV (filtrado)
         csv_bytes = dff.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Descargar reporte (CSV)",
@@ -289,38 +273,58 @@ if admin_ok():
             mime="text/csv",
         )
 
-        st.markdown("### 📈 Gráficos")
+        st.markdown("### 📈 Gráficos (clic por estado)")
 
-        # asegurar fecha como fecha
         df_plot = df.copy()
         df_plot["fecha_cita"] = pd.to_datetime(df_plot["fecha_cita"], errors="coerce").dt.date
 
-        # atendidos por día
-        atendidos = df_plot[df_plot["estado"].astype(str) == "ATENDIDO"]
-        if atendidos.empty:
-            st.info("Todavía no hay unidades ATENDIDAS para graficar.")
+        hoy = date.today()
+        lunes = hoy - timedelta(days=hoy.weekday())
+        sabado = lunes + timedelta(days=5)
+
+        colA, colB = st.columns(2)
+        with colA:
+            r_ini = st.date_input("Desde", value=lunes, key="r_ini")
+        with colB:
+            r_fin = st.date_input("Hasta", value=sabado, key="r_fin")
+
+        df_plot = df_plot[(df_plot["fecha_cita"] >= r_ini) & (df_plot["fecha_cita"] <= r_fin)]
+
+        estado_click = st.radio(
+            "Ver gráfico por estado:",
+            ["EN COLA", "EN PROCESO", "ATENDIDO", "CANCELADO", "TODOS"],
+            horizontal=True,
+        )
+
+        if estado_click != "TODOS":
+            df_estado = df_plot[df_plot["estado"].astype(str) == estado_click]
         else:
-            por_dia = atendidos.groupby("fecha_cita").size().sort_index()
+            df_estado = df_plot.copy()
 
-            fig = plt.figure()
-            plt.plot(por_dia.index, por_dia.values, marker="o")
-            plt.xticks(rotation=45)
-            plt.title("Unidades ATENDIDAS por día")
-            plt.xlabel("Fecha")
-            plt.ylabel("Cantidad")
-            st.pyplot(fig)
-
-            # atendidos por semana (semana ISO)
-            atendidos_dt = pd.to_datetime(atendidos["fecha_cita"])
-            semana = atendidos_dt.dt.isocalendar().week
-            por_semana = semana.value_counts().sort_index()
-
-            fig2 = plt.figure()
-            plt.bar(por_semana.index.astype(str), por_semana.values)
-            plt.title("Unidades ATENDIDAS por semana (ISO)")
-            plt.xlabel("Semana")
-            plt.ylabel("Cantidad")
-            st.pyplot(fig2)
+        if df_estado.empty:
+            st.info("No hay datos para ese filtro.")
+        else:
+            if estado_click == "TODOS":
+                por_dia = df_plot.groupby(["fecha_cita", "estado"]).size().reset_index(name="cantidad")
+                piv = por_dia.pivot(index="fecha_cita", columns="estado", values="cantidad").fillna(0).sort_index()
+                fig = plt.figure()
+                for col in piv.columns:
+                    plt.plot(piv.index, piv[col].values, marker="o", label=col)
+                plt.xticks(rotation=45)
+                plt.title("Citas por día (todos los estados)")
+                plt.xlabel("Fecha")
+                plt.ylabel("Cantidad")
+                plt.legend()
+                st.pyplot(fig)
+            else:
+                por_dia_simple = df_estado.groupby("fecha_cita").size().sort_index()
+                fig = plt.figure()
+                plt.plot(por_dia_simple.index, por_dia_simple.values, marker="o")
+                plt.xticks(rotation=45)
+                plt.title(f"{estado_click} por día")
+                plt.xlabel("Fecha")
+                plt.ylabel("Cantidad")
+                st.pyplot(fig)
 
         st.markdown("### Cambiar estado por Ticket")
         ticket = st.text_input("ID Ticket (ej: TKT-XXXXXXXX)")
