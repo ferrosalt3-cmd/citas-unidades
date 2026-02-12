@@ -14,6 +14,7 @@ import plotly.express as px
 from reportlab.lib.pagesizes import A6
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.lib import colors
 
 
 # ----------------------------
@@ -53,7 +54,7 @@ COLUMNAS = [
 
 
 # ----------------------------
-# Branding (Logo + Fondo)
+# Branding (LOGO + FONDO)
 # ----------------------------
 ASSETS_DIR = Path(__file__).parent / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
@@ -73,76 +74,77 @@ def _img_to_base64(path: Path) -> str:
 logo_b64 = _img_to_base64(LOGO_PATH)
 fondo_b64 = _img_to_base64(FONDO_PATH)
 
-# ✅ Mejora lectura de inputs y cards (sin quitar tu fondo)
-if fondo_b64:
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-            background: url("{fondo_b64}") no-repeat center center fixed;
-            background-size: cover;
-        }}
+# CSS para que los inputs NO “se pierdan” con el fondo
+st.markdown(
+    f"""
+    <style>
+    .stApp {{
+        background: url("{fondo_b64}") no-repeat center center fixed;
+        background-size: cover;
+    }}
 
-        /* Overlay suave para legibilidad */
-        .stApp::before {{
-            content: "";
-            position: fixed;
-            inset: 0;
-            background: rgba(255,255,255,0.84);
-            z-index: 0;
-            pointer-events: none;
-        }}
+    /* Overlay suave */
+    .stApp::before {{
+        content:"";
+        position:fixed;
+        inset:0;
+        background:rgba(255,255,255,0.82);
+        z-index:0;
+        pointer-events:none;
+    }}
 
-        /* Todo por encima del overlay */
-        section[data-testid="stSidebar"],
-        main,
-        header {{
-            position: relative;
-            z-index: 1;
-        }}
+    main, header, section[data-testid="stSidebar"] {{
+        position:relative;
+        z-index:1;
+    }}
 
-        /* Sidebar */
-        section[data-testid="stSidebar"] > div {{
-            background: rgba(255,255,255,0.92);
-            border-right: 1px solid rgba(0,0,0,0.06);
-        }}
+    section[data-testid="stSidebar"] > div {{
+        background: rgba(255,255,255,0.94);
+        border-right: 1px solid rgba(0,0,0,0.06);
+    }}
 
-        /* Cards/containers */
-        div[data-testid="stVerticalBlockBorderWrapper"] {{
-            background: rgba(255,255,255,0.92);
-            border-radius: 14px;
-            border: 1px solid rgba(0,0,0,0.06);
-        }}
+    /* Inputs con fondo blanco (para que se lean SIEMPRE) */
+    div[data-baseweb="input"] > div {{
+        background: rgba(255,255,255,0.98) !important;
+    }}
+    div[data-baseweb="textarea"] textarea {{
+        background: rgba(255,255,255,0.98) !important;
+    }}
+    div[data-baseweb="select"] > div {{
+        background: rgba(255,255,255,0.98) !important;
+    }}
 
-        /* ✅ Inputs: que no se pierdan con el fondo */
-        input, textarea, [data-baseweb="select"] > div {{
-            background: rgba(255,255,255,0.98) !important;
-        }}
+    /* Cards */
+    div[data-testid="stMetric"],
+    div[data-testid="stDataFrame"],
+    div[data-testid="stPlotlyChart"] {{
+        background: rgba(255,255,255,0.94);
+        border-radius: 12px;
+        padding: 10px;
+        border: 1px solid rgba(0,0,0,0.06);
+    }}
 
-        /* Tabs */
-        button[role="tab"] {{
-            border-radius: 10px !important;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    /* Tabs */
+    button[role="tab"] {{
+        border-radius: 10px !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 def header_brand():
-    # ✅ (4) Quitamos el logo grande del header (el que marcaste con círculo)
-    # Solo dejamos título/subtítulo.
+    # 👇 IMPORTANTE: NO mostramos el logo grande arriba (para quitar el “logo del círculo”)
     st.markdown(
         """
-        <div style="margin-top:6px">
-          <h1 style="margin:0; font-size:40px;">Citas de Unidades</h1>
-          <div style="margin-top:4px; font-size:15px; opacity:0.8;">
-            Plataforma de registro y control por turnos
-          </div>
+        <div style="padding:8px 0 2px 0;">
+          <h1 style="margin:0;">Citas de Unidades</h1>
+          <div style="opacity:0.7;">Plataforma de registro y control por turnos</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    st.divider()
 
 
 # ----------------------------
@@ -155,19 +157,15 @@ def get_client():
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
-
 def get_sheet():
     sheet_id = st.secrets.get("SHEET_ID", "")
     if not sheet_id:
-        raise RuntimeError("Falta SHEET_ID en Secrets (debe ir FUERA del bloque [gcp_service_account]).")
-
+        raise RuntimeError("Falta SHEET_ID en Secrets.")
     gc = get_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(WORKSHEET_NAME)
-
     ensure_columns(ws)
     return ws
-
 
 def ensure_columns(ws):
     headers = ws.row_values(1)
@@ -177,34 +175,42 @@ def ensure_columns(ws):
 
     missing = [c for c in COLUMNAS if c not in headers]
     if missing:
-        new_headers = headers + missing
-        ws.update("A1", [new_headers])
-
+        ws.update("A1", [headers + missing])
 
 def read_all(ws) -> pd.DataFrame:
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     if df.empty:
         df = pd.DataFrame(columns=COLUMNAS)
+
+    # asegurar columnas
     for c in COLUMNAS:
         if c not in df.columns:
             df[c] = ""
-    return df[COLUMNAS]
 
+    return df[COLUMNAS]
 
 def generar_ticket():
     return "TKT-" + hashlib.sha1(str(datetime.now()).encode()).hexdigest()[:8].upper()
 
-
 def safe_str(x):
     return "" if x is None else str(x)
 
-
 def append_cita(ws, row_dict: dict):
+    """
+    ✅ CLAVE:
+    - RAW para que Google Sheets NO convierta datetime a números (46065...)
+    - Apostrofe en fecha/creado_en para forzar TEXTO
+    """
     headers = ws.row_values(1)
-    row = [row_dict.get(h, "") for h in headers]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    row_dict = row_dict.copy()
 
+    for k in ["fecha_cita", "creado_en", "telefono_registro"]:
+        if k in row_dict and row_dict[k] != "":
+            row_dict[k] = "'" + str(row_dict[k])
+
+    row = [row_dict.get(h, "") for h in headers]
+    ws.append_row(row, value_input_option="RAW")
 
 def update_estado_por_row(ws, row_number: int, nuevo_estado: str):
     headers = ws.row_values(1)
@@ -220,16 +226,13 @@ def update_estado_por_row(ws, row_number: int, nuevo_estado: str):
 def lunes_de_semana(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
-
 def semana_lun_sab(d: date):
     start = lunes_de_semana(d)
     days = [start + timedelta(days=i) for i in range(6)]  # lunes..sábado
     return start, days
 
-
 def fmt_fecha(d: date) -> str:
     return d.strftime("%Y-%m-%d")
-
 
 def nombre_dia_es(d: date) -> str:
     dias = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
@@ -239,26 +242,24 @@ def nombre_dia_es(d: date) -> str:
 # ----------------------------
 # Turnos / cupos
 # ----------------------------
+def turnos_para_fecha(fecha_dt: date):
+    # ✅ Sábado (weekday 5) solo 2 turnos
+    if fecha_dt.weekday() == 5:
+        return TURNOS_BASE[:2]
+    return TURNOS_BASE
+
 def cupos_disponibles(df: pd.DataFrame, fecha: str, turno: str, capacidad: int) -> int:
     if df.empty:
         return capacidad
-    sub = df[(df["fecha_cita"] == fecha) & (df["turno"] == turno)]
-    sub = sub[sub["estado"] != "CANCELADO"]  # cancelados no consumen cupo
+    sub = df[(df["fecha_cita"].astype(str) == fecha) & (df["turno"] == turno)]
+    sub = sub[sub["estado"] != "CANCELADO"]
     usados = len(sub)
     return max(0, capacidad - usados)
 
-
-def turnos_disponibles(df: pd.DataFrame, fecha: str, weekday: int):
-    """
-    ✅ (1) Si es sábado (weekday=5), solo habilitar Turno 1 y Turno 2.
-    """
+def turnos_disponibles(df: pd.DataFrame, fecha_dt: date, fecha_str: str):
     opciones = []
-    for t in TURNOS_BASE:
-        # sábado: solo turnos 1 y 2
-        if weekday == 5 and t["turno"] not in ["Turno 1", "Turno 2"]:
-            continue
-
-        libres = cupos_disponibles(df, fecha, t["turno"], t["capacidad"])
+    for t in turnos_para_fecha(fecha_dt):
+        libres = cupos_disponibles(df, fecha_str, t["turno"], t["capacidad"])
         if libres > 0:
             opciones.append((t["turno"], t["horario"], libres, t["capacidad"]))
     return opciones
@@ -272,71 +273,57 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
     c = canvas.Canvas(buffer, pagesize=A6)
     width, height = A6
 
-    # Fondo suave (marca de agua)
-    try:
-        if FONDO_PATH.exists():
-            bg = ImageReader(str(FONDO_PATH))
-            c.saveState()
-            c.setFillAlpha(0.10)
-            c.drawImage(bg, 0, 0, width=width, height=height, mask="auto")
-            c.restoreState()
-    except Exception:
-        pass
+    # Fondo
+    if FONDO_PATH.exists():
+        try:
+            c.drawImage(ImageReader(str(FONDO_PATH)), 0, 0, width=width, height=height, mask="auto")
+        except Exception:
+            pass
 
-    top = height - 18
+    # Caja blanca (overlay)
+    try:
+        c.saveState()
+        c.setFillColor(colors.white)
+        c.setFillAlpha(0.90)
+        c.rect(10, 10, width - 20, height - 20, fill=1, stroke=0)
+        c.restoreState()
+    except Exception:
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(10, 10, width - 20, height - 20, fill=1, stroke=0)
 
     # Logo
-    try:
-        if LOGO_PATH.exists():
-            logo = ImageReader(str(LOGO_PATH))
-            logo_w = 110
-            logo_h = 28
-            c.drawImage(
-                logo, 18, top - logo_h,
-                width=logo_w, height=logo_h,
-                preserveAspectRatio=True, mask="auto",
-            )
-    except Exception:
-        pass
+    if LOGO_PATH.exists():
+        try:
+            c.drawImage(ImageReader(str(LOGO_PATH)), 18, height - 55, width=90, height=30, mask="auto")
+        except Exception:
+            pass
 
     # Título
+    c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 12)
-    c.drawRightString(width - 18, top - 10, "TICKET DE CITA")
-
-    # Línea separadora
-    c.setLineWidth(0.8)
-    c.setStrokeColorRGB(0.15, 0.15, 0.15)
-    c.line(18, top - 38, width - 18, top - 38)
+    c.drawString(18, height - 22, "TICKET DE CITA")
 
     # Cuerpo
-    y = top - 52
-    left = 18
+    y = height - 70
+    c.setFont("Helvetica", 9.5)
 
-    def row(label, value):
-        nonlocal y
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(left, y, f"{label}:")
-        c.setFont("Helvetica", 9)
-        c.drawString(left + 82, y, str(value) if value is not None else "")
+    lines = [
+        f"Ticket: {ticket_data.get('id_ticket','')}",
+        f"Fecha: {ticket_data.get('fecha_cita','')}",
+        f"Turno: {ticket_data.get('turno','')} ({ticket_data.get('horario_turno','')})",
+        f"Placa tracto: {ticket_data.get('placa_tracto','')}",
+        f"Placa carreta: {ticket_data.get('placa_carreta','')}",
+        f"Chofer: {ticket_data.get('chofer_nombre','')}",
+        f"Licencia: {ticket_data.get('licencia','')}",
+        f"Transporte: {ticket_data.get('transporte','')}",
+        f"Operación: {ticket_data.get('tipo_operacion','')}",
+        f"Estado: {ticket_data.get('estado','')}",
+        f"Registrado por: {ticket_data.get('registrado_por','')}",
+        f"Teléfono: {ticket_data.get('telefono_registro','')}",
+    ]
+    for line in lines:
+        c.drawString(18, y, line)
         y -= 12
-
-    row("Ticket", ticket_data.get("id_ticket", ""))
-    row("Fecha", ticket_data.get("fecha_cita", ""))
-    row("Turno", f"{ticket_data.get('turno','')} ({ticket_data.get('horario_turno','')})")
-    row("Placa tracto", ticket_data.get("placa_tracto", ""))
-    row("Placa carreta", ticket_data.get("placa_carreta", ""))
-    row("Chofer", ticket_data.get("chofer_nombre", ""))
-    row("Licencia", ticket_data.get("licencia", ""))
-    row("Transporte", ticket_data.get("transporte", ""))
-    row("Operación", ticket_data.get("tipo_operacion", ""))
-    row("Estado", ticket_data.get("estado", ""))
-    row("Registrado por", ticket_data.get("registrado_por", ""))
-    row("Teléfono", ticket_data.get("telefono_registro", ""))
-
-    # Footer
-    c.setFont("Helvetica-Oblique", 7.5)
-    c.setFillGray(0.25)
-    c.drawString(18, 14, f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     c.showPage()
     c.save()
@@ -349,7 +336,7 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
 # ----------------------------
 header_brand()
 
-# ✅ (4) El logo se queda en el sidebar (Admin)
+# ✅ Logo SOLO en sidebar (como pediste)
 if LOGO_PATH.exists():
     st.sidebar.image(str(LOGO_PATH), use_container_width=True)
 
@@ -368,19 +355,21 @@ if admin_ok:
 
 tab_selected = st.tabs(tabs)
 
-# Cargar sheet/df
+# Conectar sheet
 try:
     ws = get_sheet()
-    df = read_all(ws)
-except Exception:
+except Exception as e:
     st.error("No se pudo conectar a Google Sheets. Revisa permisos del Service Account y el SHEET_ID.")
     st.stop()
 
 
 # ----------------------------
-# TAB 1: Registro (Chofer)
+# TAB 1: Registro
 # ----------------------------
 with tab_selected[0]:
+    # Leer siempre “fresco”
+    df = read_all(ws)
+
     st.subheader("Registro (Chofer)")
 
     hoy = date.today()
@@ -391,8 +380,7 @@ with tab_selected[0]:
     fecha_sel = opciones_fecha[fecha_label]
     fecha_str = fmt_fecha(fecha_sel)
 
-    # ✅ (1) sábado solo 2 turnos
-    disponibles = turnos_disponibles(df, fecha_str, weekday=fecha_sel.weekday())
+    disponibles = turnos_disponibles(df, fecha_sel, fecha_str)
     if not disponibles:
         st.warning("No hay cupos disponibles para esa fecha (todos los turnos están llenos).")
         st.stop()
@@ -425,7 +413,6 @@ with tab_selected[0]:
         elif not registrado_por.strip():
             st.error("El campo **Registrado por** es obligatorio.")
         else:
-            # verificación final de cupos
             df_now = read_all(ws)
             libres_now = cupos_disponibles(df_now, fecha_str, turno_sel, cap_sel)
             if libres_now <= 0:
@@ -454,20 +441,6 @@ with tab_selected[0]:
 
                 st.success(f"🎟️ Ticket creado: **{ticket}**")
 
-                st.code(
-                    f"TICKET: {ticket}\n"
-                    f"FECHA: {fecha_str}\n"
-                    f"TURNO: {turno_sel} ({horario_sel})\n"
-                    f"PLACA TRACTO: {data['placa_tracto']}\n"
-                    f"PLACA CARRETA: {data['placa_carreta']}\n"
-                    f"CHOFER: {data['chofer_nombre']}\n"
-                    f"OPERACIÓN: {data['tipo_operacion']}\n"
-                    f"ESTADO: {data['estado']}\n"
-                    f"REGISTRADO POR: {data['registrado_por']}\n"
-                    f"TELÉFONO: {data['telefono_registro'] or '-'}\n",
-                    language="text",
-                )
-
                 pdf_bytes = make_ticket_pdf_bytes(data)
                 st.download_button(
                     "⬇️ Descargar ticket (PDF)",
@@ -476,12 +449,17 @@ with tab_selected[0]:
                     mime="application/pdf",
                 )
 
+                # ✅ Para que todo se refresque (y dashboard vea el nuevo registro)
+                st.rerun()
+
 
 # ----------------------------
 # TAB 2: Panel admin
 # ----------------------------
 if admin_ok:
     with tab_selected[1]:
+        df = read_all(ws)
+
         st.subheader("Panel de control (Admin)")
 
         df_admin = df.copy()
@@ -541,16 +519,22 @@ if admin_ok:
 # ----------------------------
 if admin_ok:
     with tab_selected[2]:
+        df = read_all(ws)
+
         st.subheader("Dashboard (Gerencia)")
 
-        # ✅ (3) Siempre refrescar datos para que el dashboard se actualice
-        df_dash = read_all(ws).copy()
+        df_dash = df.copy()
 
-        # ✅ convertir fecha correctamente
-        df_dash["fecha_cita_dt"] = pd.to_datetime(df_dash["fecha_cita"], errors="coerce").dt.date
+        # ✅ MUY IMPORTANTE: parsea fecha aunque venga como 12/2/2026
+        df_dash["fecha_cita_dt"] = pd.to_datetime(
+            df_dash["fecha_cita"].astype(str),
+            errors="coerce",
+            dayfirst=True,
+        ).dt.date
 
         hoy = date.today()
         start_week, _days = semana_lun_sab(hoy)
+
         min_d = start_week - timedelta(days=7 * 12)
         max_d = start_week + timedelta(days=7 * 52)
 
@@ -578,48 +562,82 @@ if admin_ok:
         k5.metric("Cancelado", int((df_w["estado"] == "CANCELADO").sum()))
 
         st.markdown("### Distribución de estados (rápido)")
-        if df_w.empty:
-            st.info("Aún no hay datos para mostrar.")
-        else:
-            estado_counts = (
-                df_w["estado"].value_counts()
-                .reindex(ESTADOS)
-                .fillna(0)
-                .astype(int)
-                .reset_index()
-            )
-            estado_counts.columns = ["estado", "cantidad"]
+        estado_counts = (
+            df_w["estado"].value_counts()
+            .reindex(ESTADOS)
+            .fillna(0)
+            .astype(int)
+            .reset_index()
+        )
+        estado_counts.columns = ["estado", "cantidad"]
 
+        if estado_counts["cantidad"].sum() == 0:
+            st.info("No hay datos para graficar en esta selección.")
+        else:
             fig_donut = px.pie(estado_counts, names="estado", values="cantidad", hole=0.55)
             fig_donut.update_traces(textinfo="label+percent+value")
             st.plotly_chart(fig_donut, use_container_width=True)
 
-        st.markdown("### Citas por turno")
-        if not df_w.empty:
-            turno_counts = (
-                df_w["turno"].value_counts()
-                .reindex([t["turno"] for t in TURNOS_BASE])
-                .fillna(0)
-                .astype(int)
-                .reset_index()
-            )
-            turno_counts.columns = ["turno", "cantidad"]
+        st.markdown("### Unidades por día (Lunes–Sábado) y por estado")
+        cal = pd.DataFrame([{"fecha": d, "dia": f"{nombre_dia_es(d)} {d.strftime('%d/%m')}"} for d in days])
+
+        grp = df_w.groupby(["fecha_cita_dt", "estado"]).size().reset_index(name="cantidad")
+        grp = grp.merge(cal, left_on="fecha_cita_dt", right_on="fecha", how="right")
+        grp["cantidad"] = grp["cantidad"].fillna(0).astype(int)
+
+        full = []
+        for d in days:
+            dia_label = f"{nombre_dia_es(d)} {d.strftime('%d/%m')}"
+            for est in ESTADOS:
+                sub = grp[(grp["fecha"] == d) & (grp["estado"] == est)]
+                full.append({"dia": dia_label, "estado": est, "cantidad": int(sub["cantidad"].iloc[0]) if not sub.empty else 0})
+        full_df = pd.DataFrame(full)
+
+        if full_df["cantidad"].sum() == 0:
+            st.info("No hay datos para graficar por día en esta selección.")
+        else:
+            fig_stack = px.bar(full_df, x="dia", y="cantidad", color="estado", barmode="stack", text="cantidad")
+            fig_stack.update_traces(textposition="outside")
+            fig_stack.update_layout(yaxis_title="Cantidad", xaxis_title="Día")
+            st.plotly_chart(fig_stack, use_container_width=True)
+
+        st.markdown("### Citas por turno (semanal)")
+        turno_counts = (
+            df_w["turno"].value_counts()
+            .reindex([t["turno"] for t in TURNOS_BASE])
+            .fillna(0)
+            .astype(int)
+            .reset_index()
+        )
+        turno_counts.columns = ["turno", "cantidad"]
+
+        if turno_counts["cantidad"].sum() == 0:
+            st.info("No hay datos para graficar por turnos en esta selección.")
+        else:
             fig_turnos = px.bar(turno_counts, x="turno", y="cantidad", text="cantidad")
             fig_turnos.update_traces(textposition="outside")
+            fig_turnos.update_layout(xaxis_title="Turno", yaxis_title="Cantidad")
             st.plotly_chart(fig_turnos, use_container_width=True)
 
-        st.markdown("### Operación (tipo)")
-        if not df_w.empty:
-            op_counts = df_w["tipo_operacion"].value_counts().reset_index()
-            op_counts.columns = ["tipo_operacion", "cantidad"]
+        st.markdown("### Operación (tipo) — semanal")
+        op_counts = df_w["tipo_operacion"].value_counts().reset_index()
+        op_counts.columns = ["tipo_operacion", "cantidad"]
+
+        if op_counts["cantidad"].sum() == 0:
+            st.info("No hay datos para graficar por operación en esta selección.")
+        else:
             fig_ops = px.bar(op_counts, x="tipo_operacion", y="cantidad", text="cantidad")
             fig_ops.update_traces(textposition="outside")
+            fig_ops.update_layout(xaxis_title="Operación", yaxis_title="Cantidad")
             st.plotly_chart(fig_ops, use_container_width=True)
 
         st.markdown("### Descargar reporte (Excel)")
         out = BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             df_w.drop(columns=["fecha_cita_dt"], errors="ignore").to_excel(writer, index=False, sheet_name="Citas")
+            estado_counts.to_excel(writer, index=False, sheet_name="Resumen_estados")
+            turno_counts.to_excel(writer, index=False, sheet_name="Turnos")
+            op_counts.to_excel(writer, index=False, sheet_name="Operaciones")
         out.seek(0)
 
         st.download_button(
