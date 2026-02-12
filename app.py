@@ -5,9 +5,10 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime, date, timedelta
 import hashlib
 from io import BytesIO
+import base64
+from pathlib import Path
 
 import plotly.express as px
-import plotly.graph_objects as go
 
 # PDF (ticket)
 from reportlab.lib.pagesizes import A6
@@ -45,10 +46,107 @@ COLUMNAS = [
     "observacion",
     "estado",
     "creado_en",
-    # ✅ NUEVO
+    # ✅ NUEVO (auditoría)
     "registrado_por",
     "telefono_registro",
 ]
+
+
+# ----------------------------
+# Branding (Logo + Fondo)
+# ----------------------------
+def _img_to_base64(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
+    b = p.read_bytes()
+    ext = p.suffix.lower().replace(".", "")
+    if ext == "jpg":
+        ext = "jpeg"
+    return f"data:image/{ext};base64," + base64.b64encode(b).decode("utf-8")
+
+
+# ✅ Coloca tus archivos en el repo (misma carpeta del app.py o en /assets)
+# Recomendado:
+#   assets/logo.jpg
+#   assets/fondo.png
+LOGO_PATH = "assets/logo.jpg"
+FONDO_PATH = "assets/fondo.png"  # renombra tu fondo a "fondo.png" para evitar espacios
+
+logo_b64 = _img_to_base64(LOGO_PATH)
+fondo_b64 = _img_to_base64(FONDO_PATH)
+
+# CSS: fondo + look & feel Ferrosalt
+if fondo_b64:
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background: url("{fondo_b64}") no-repeat center center fixed;
+            background-size: cover;
+        }}
+
+        /* Overlay suave para legibilidad */
+        .stApp::before {{
+            content: "";
+            position: fixed;
+            inset: 0;
+            background: rgba(255,255,255,0.78);
+            z-index: 0;
+            pointer-events: none;
+        }}
+
+        /* Todo el contenido por encima del overlay */
+        section[data-testid="stSidebar"],
+        main,
+        header {{
+            position: relative;
+            z-index: 1;
+        }}
+
+        /* Sidebar un poco más elegante */
+        section[data-testid="stSidebar"] > div {{
+            background: rgba(255,255,255,0.90);
+            border-right: 1px solid rgba(0,0,0,0.06);
+        }}
+
+        /* Cards */
+        div[data-testid="stMetric"],
+        div[data-testid="stDataFrame"],
+        div[data-testid="stPlotlyChart"] {{
+            background: rgba(255,255,255,0.90);
+            border: 1px solid rgba(0,0,0,0.06);
+            border-radius: 12px;
+            padding: 10px;
+        }}
+
+        /* Tabs */
+        button[role="tab"] {{
+            border-radius: 10px !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def header_brand():
+    colL, colR = st.columns([1, 4])
+    with colL:
+        if Path(LOGO_PATH).exists():
+            st.image(LOGO_PATH, use_container_width=True)
+    with colR:
+        st.markdown(
+            """
+            <div style="margin-top:6px">
+              <h1 style="margin:0; font-size:40px;">Citas de Unidades</h1>
+              <div style="margin-top:4px; font-size:15px; opacity:0.8;">
+                Plataforma de registro y control por turnos
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # ----------------------------
@@ -76,13 +174,11 @@ def get_sheet():
 
 
 def ensure_columns(ws):
-    # Si la hoja está vacía, crea encabezados
     headers = ws.row_values(1)
     if not headers:
         ws.append_row(COLUMNAS)
         return
 
-    # Agregar columnas faltantes
     missing = [c for c in COLUMNAS if c not in headers]
     if missing:
         new_headers = headers + missing
@@ -94,7 +190,6 @@ def read_all(ws) -> pd.DataFrame:
     df = pd.DataFrame(data)
     if df.empty:
         df = pd.DataFrame(columns=COLUMNAS)
-    # normalizar
     for c in COLUMNAS:
         if c not in df.columns:
             df[c] = ""
@@ -116,7 +211,6 @@ def append_cita(ws, row_dict: dict):
 
 
 def update_estado_por_row(ws, row_number: int, nuevo_estado: str):
-    # Columna "estado"
     headers = ws.row_values(1)
     if "estado" not in headers:
         raise RuntimeError("No existe columna 'estado' en la hoja.")
@@ -153,8 +247,7 @@ def cupos_disponibles(df: pd.DataFrame, fecha: str, turno: str, capacidad: int) 
     if df.empty:
         return capacidad
     sub = df[(df["fecha_cita"] == fecha) & (df["turno"] == turno)]
-    # Cancelados NO ocupan cupo
-    sub = sub[sub["estado"] != "CANCELADO"]
+    sub = sub[sub["estado"] != "CANCELADO"]  # cancelados no consumen cupo
     usados = len(sub)
     return max(0, capacidad - usados)
 
@@ -174,14 +267,14 @@ def turnos_disponibles(df: pd.DataFrame, fecha: str):
 def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A6)
-    width, height = A6
+    _, height = A6
 
-    y = height - 30
+    y = height - 28
     c.setFont("Helvetica-Bold", 12)
     c.drawString(20, y, "TICKET DE CITA")
     y -= 18
 
-    c.setFont("Helvetica", 10)
+    c.setFont("Helvetica", 9.6)
     lines = [
         f"Ticket: {ticket_data.get('id_ticket','')}",
         f"Fecha: {ticket_data.get('fecha_cita','')}",
@@ -193,13 +286,12 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
         f"Transporte: {ticket_data.get('transporte','')}",
         f"Operación: {ticket_data.get('tipo_operacion','')}",
         f"Estado: {ticket_data.get('estado','')}",
-        # ✅ NUEVO
         f"Registrado por: {ticket_data.get('registrado_por','')}",
         f"Teléfono: {ticket_data.get('telefono_registro','')}",
     ]
     for line in lines:
         c.drawString(20, y, line)
-        y -= 14
+        y -= 13
 
     c.showPage()
     c.save()
@@ -210,9 +302,12 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
 # ----------------------------
 # UI
 # ----------------------------
-st.title("🧾 Citas de Unidades (por turnos)")
+header_brand()
 
-# Sidebar admin
+# Sidebar admin + logo pequeño
+if Path(LOGO_PATH).exists():
+    st.sidebar.image(LOGO_PATH, use_container_width=True)
+
 st.sidebar.subheader("🔒 Admin")
 admin_password_input = st.sidebar.text_input("Contraseña admin", type="password")
 admin_ok = (admin_password_input != "") and (admin_password_input == st.secrets.get("ADMIN_PASSWORD", ""))
@@ -222,18 +317,17 @@ if admin_ok:
 else:
     st.sidebar.caption("Choferes: no usar.")
 
-# Tabs
 tabs = ["🧑‍✈️ Registrar cita"]
 if admin_ok:
     tabs += ["🛠️ Panel admin", "📊 Dashboard gerencia"]
 
 tab_selected = st.tabs(tabs)
 
-# Cargar sheet/df (con manejo de error amable)
+# Cargar sheet/df
 try:
     ws = get_sheet()
     df = read_all(ws)
-except Exception as e:
+except Exception:
     st.error("No se pudo conectar a Google Sheets. Revisa permisos del Service Account y el SHEET_ID.")
     st.stop()
 
@@ -245,24 +339,19 @@ with tab_selected[0]:
     st.subheader("Registro (Chofer)")
 
     hoy = date.today()
-    start_week, days = semana_lun_sab(hoy)
+    _, days = semana_lun_sab(hoy)
     opciones_fecha = {f"{nombre_dia_es(d)} {d.strftime('%d/%m/%Y')}": d for d in days}
 
-    colA, colB = st.columns([2, 1])
-    with colA:
-        fecha_label = st.selectbox("Fecha (Semana Lunes–Sábado)", list(opciones_fecha.keys()), index=0)
-        fecha_sel = opciones_fecha[fecha_label]
-        fecha_str = fmt_fecha(fecha_sel)
+    fecha_label = st.selectbox("Fecha (Semana Lunes–Sábado)", list(opciones_fecha.keys()), index=0)
+    fecha_sel = opciones_fecha[fecha_label]
+    fecha_str = fmt_fecha(fecha_sel)
 
     disponibles = turnos_disponibles(df, fecha_str)
     if not disponibles:
         st.warning("No hay cupos disponibles para esa fecha (todos los turnos están llenos).")
         st.stop()
 
-    turno_labels = [
-        f"{t} ({h}) — Cupos: {libres}"
-        for (t, h, libres, cap) in disponibles
-    ]
+    turno_labels = [f"{t} ({h}) — Cupos: {libres}" for (t, h, libres, _cap) in disponibles]
     choice = st.selectbox("Selecciona turno disponible", turno_labels)
     idx = turno_labels.index(choice)
     turno_sel, horario_sel, libres_sel, cap_sel = disponibles[idx]
@@ -278,7 +367,6 @@ with tab_selected[0]:
         tipo = st.selectbox("Tipo de operación", ["Carga", "Descarga", "Importación", "Exportación"])
         obs = st.text_area("Observación")
 
-    # ✅ NUEVO (solo esto)
     st.markdown("### Información de registro")
     registrado_por = st.text_input("Registrado por *")
     telefono_registro = st.text_input("Teléfono (opcional)")
@@ -291,7 +379,6 @@ with tab_selected[0]:
         elif not registrado_por.strip():
             st.error("El campo **Registrado por** es obligatorio.")
         else:
-            # Verificación final de cupos (por si entran 2 a la vez)
             df_now = read_all(ws)
             libres_now = cupos_disponibles(df_now, fecha_str, turno_sel, cap_sel)
             if libres_now <= 0:
@@ -309,11 +396,10 @@ with tab_selected[0]:
                     "transporte": safe_str(transporte).strip(),
                     "tipo_operacion": tipo,
                     "fecha_cita": fecha_str,
-                    "hora_cita": "",  # no usamos hora exacta (por turnos)
+                    "hora_cita": "",
                     "observacion": safe_str(obs).strip(),
                     "estado": "EN COLA",
                     "creado_en": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    # ✅ NUEVO
                     "registrado_por": registrado_por.strip(),
                     "telefono_registro": telefono_registro.strip(),
                 }
@@ -321,7 +407,6 @@ with tab_selected[0]:
 
                 st.success(f"🎟️ Ticket creado: **{ticket}**")
 
-                # Mostrar ticket bonito
                 st.code(
                     f"TICKET: {ticket}\n"
                     f"FECHA: {fecha_str}\n"
@@ -336,7 +421,6 @@ with tab_selected[0]:
                     language="text",
                 )
 
-                # PDF descargable
                 pdf_bytes = make_ticket_pdf_bytes(data)
                 st.download_button(
                     "⬇️ Descargar ticket (PDF)",
@@ -347,7 +431,7 @@ with tab_selected[0]:
 
 
 # ----------------------------
-# TAB 2: Panel admin (edición rápida de estado por click)
+# TAB 2: Panel admin
 # ----------------------------
 if admin_ok:
     with tab_selected[1]:
@@ -355,7 +439,6 @@ if admin_ok:
 
         df_admin = df.copy()
 
-        # Filtros
         colf1, colf2, colf3 = st.columns(3)
         with colf1:
             filtro_fecha = st.text_input("Filtrar fecha (YYYY-MM-DD)", "")
@@ -373,17 +456,11 @@ if admin_ok:
 
         st.caption("✅ Cambia el estado directamente en la tabla y luego pulsa **Guardar cambios**.")
 
-        # Para poder actualizar filas exactas, necesitamos row_number real en Sheets.
-        # Como get_all_records no trae row_number, lo reconstruimos leyendo todo y usando el orden actual.
-        # OJO: Esto asume que no hay filas vacías intermedias (normal en tu caso).
-        df_full = read_all(ws)
-        df_full = df_full.reset_index(drop=True)
-        df_full["__row"] = df_full.index + 2  # +2 porque fila 1 es encabezado
+        df_full = read_all(ws).reset_index(drop=True)
+        df_full["__row"] = df_full.index + 2  # header=1
 
-        # Unimos para tener __row en el filtrado
         df_admin = df_admin.merge(df_full[["id_ticket", "__row"]], on="id_ticket", how="left")
 
-        # Editor (solo estado editable)
         edited = st.data_editor(
             df_admin,
             use_container_width=True,
@@ -398,7 +475,6 @@ if admin_ok:
 
         if st.button("💾 Guardar cambios de estado"):
             try:
-                # Comparar con df_admin original para detectar cambios
                 merged = edited.merge(df_admin[["id_ticket", "estado"]], on="id_ticket", suffixes=("_new", "_old"))
                 cambios = merged[merged["estado_new"] != merged["estado_old"]]
 
@@ -406,8 +482,7 @@ if admin_ok:
                     st.info("No hay cambios.")
                 else:
                     for _, r in cambios.iterrows():
-                        row_number = int(r["__row"])
-                        update_estado_por_row(ws, row_number, r["estado_new"])
+                        update_estado_por_row(ws, int(r["__row"]), r["estado_new"])
                     st.success(f"Estados actualizados: {len(cambios)}")
                     st.rerun()
             except Exception:
@@ -415,31 +490,31 @@ if admin_ok:
 
 
 # ----------------------------
-# TAB 3: Dashboard gerencia (profesional + export Excel)
+# TAB 3: Dashboard gerencia
 # ----------------------------
 if admin_ok:
     with tab_selected[2]:
         st.subheader("Dashboard (Gerencia)")
 
         df_dash = df.copy()
-        # Normaliza fecha a date
         df_dash["fecha_cita_dt"] = pd.to_datetime(df_dash["fecha_cita"], errors="coerce").dt.date
 
-        # Selección de semana (Lun–Sáb)
         hoy = date.today()
-        start_week, days = semana_lun_sab(hoy)
+        start_week, _days = semana_lun_sab(hoy)
         min_d = start_week - timedelta(days=7 * 12)
         max_d = start_week + timedelta(days=7 * 52)
 
-        colw1, colw2 = st.columns([2, 2])
-        with colw1:
-            semana_base = st.date_input("Semana (elige cualquier día de esa semana)", value=hoy, min_value=min_d, max_value=max_d)
+        semana_base = st.date_input(
+            "Semana (elige cualquier día de esa semana)",
+            value=hoy,
+            min_value=min_d,
+            max_value=max_d,
+        )
         start_week, days = semana_lun_sab(semana_base)
         set_days = set(days)
 
         df_w = df_dash[df_dash["fecha_cita_dt"].isin(set_days)].copy()
 
-        # KPIs
         total = len(df_w)
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Total", total)
@@ -448,62 +523,40 @@ if admin_ok:
         k4.metric("Atendido", int((df_w["estado"] == "ATENDIDO").sum()))
         k5.metric("Cancelado", int((df_w["estado"] == "CANCELADO").sum()))
 
-        # Donut por estado (con etiquetas)
         st.markdown("### Distribución de estados (rápido)")
-        estado_counts = df_w["estado"].value_counts().reindex(ESTADOS).fillna(0).astype(int).reset_index()
+        estado_counts = (
+            df_w["estado"].value_counts()
+            .reindex(ESTADOS)
+            .fillna(0)
+            .astype(int)
+            .reset_index()
+        )
         estado_counts.columns = ["estado", "cantidad"]
 
-        fig_donut = px.pie(
-            estado_counts,
-            names="estado",
-            values="cantidad",
-            hole=0.55,
-        )
+        fig_donut = px.pie(estado_counts, names="estado", values="cantidad", hole=0.55)
         fig_donut.update_traces(textinfo="label+percent+value")
         st.plotly_chart(fig_donut, use_container_width=True)
 
-        # Barras apiladas por día (Lun–Sáb) y estado
         st.markdown("### Unidades por día (Lunes–Sábado) y por estado")
+        cal = pd.DataFrame([{"fecha": d, "dia": f"{nombre_dia_es(d)} {d.strftime('%d/%m')}"} for d in days])
 
-        # Construir calendario de días para que SIEMPRE salgan (aunque sea 0)
-        day_rows = []
-        for d in days:
-            day_rows.append({"fecha": d, "dia": f"{nombre_dia_es(d)} {d.strftime('%d/%m')}"})
-        cal = pd.DataFrame(day_rows)
-
-        grp = (
-            df_w.groupby(["fecha_cita_dt", "estado"])
-            .size()
-            .reset_index(name="cantidad")
-        )
+        grp = df_w.groupby(["fecha_cita_dt", "estado"]).size().reset_index(name="cantidad")
         grp = grp.merge(cal, left_on="fecha_cita_dt", right_on="fecha", how="right")
-        grp["estado"] = grp["estado"].fillna("EN COLA")  # placeholder
         grp["cantidad"] = grp["cantidad"].fillna(0).astype(int)
 
-        # Para apilado correcto con ceros por estado
         full = []
         for d in days:
+            dia_label = f"{nombre_dia_es(d)} {d.strftime('%d/%m')}"
             for est in ESTADOS:
                 sub = grp[(grp["fecha"] == d) & (grp["estado"] == est)]
-                if sub.empty:
-                    full.append({"dia": f"{nombre_dia_es(d)} {d.strftime('%d/%m')}", "estado": est, "cantidad": 0})
-                else:
-                    full.append({"dia": sub["dia"].iloc[0], "estado": est, "cantidad": int(sub["cantidad"].iloc[0])})
+                full.append({"dia": dia_label, "estado": est, "cantidad": int(sub["cantidad"].iloc[0]) if not sub.empty else 0})
         full_df = pd.DataFrame(full)
 
-        fig_stack = px.bar(
-            full_df,
-            x="dia",
-            y="cantidad",
-            color="estado",
-            barmode="stack",
-            text="cantidad",
-        )
+        fig_stack = px.bar(full_df, x="dia", y="cantidad", color="estado", barmode="stack", text="cantidad")
         fig_stack.update_traces(textposition="outside")
         fig_stack.update_layout(yaxis_title="Cantidad", xaxis_title="Día")
         st.plotly_chart(fig_stack, use_container_width=True)
 
-        # Operación por turno (semanal)
         st.markdown("### Citas por turno (semanal)")
         turno_counts = (
             df_w["turno"].value_counts()
@@ -519,7 +572,6 @@ if admin_ok:
         fig_turnos.update_layout(xaxis_title="Turno", yaxis_title="Cantidad")
         st.plotly_chart(fig_turnos, use_container_width=True)
 
-        # Operaciones (tipo)
         st.markdown("### Operación (tipo) — semanal")
         op_counts = df_w["tipo_operacion"].value_counts().reset_index()
         op_counts.columns = ["tipo_operacion", "cantidad"]
@@ -528,7 +580,6 @@ if admin_ok:
         fig_ops.update_layout(xaxis_title="Operación", yaxis_title="Cantidad")
         st.plotly_chart(fig_ops, use_container_width=True)
 
-        # Export Excel
         st.markdown("### Descargar reporte (Excel)")
         out = BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
