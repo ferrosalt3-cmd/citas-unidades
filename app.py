@@ -45,6 +45,9 @@ COLUMNAS = [
     "observacion",
     "estado",
     "creado_en",
+    # ✅ NUEVO
+    "registrado_por",
+    "telefono_registro",
 ]
 
 
@@ -190,6 +193,9 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
         f"Transporte: {ticket_data.get('transporte','')}",
         f"Operación: {ticket_data.get('tipo_operacion','')}",
         f"Estado: {ticket_data.get('estado','')}",
+        # ✅ NUEVO
+        f"Registrado por: {ticket_data.get('registrado_por','')}",
+        f"Teléfono: {ticket_data.get('telefono_registro','')}",
     ]
     for line in lines:
         c.drawString(20, y, line)
@@ -272,11 +278,18 @@ with tab_selected[0]:
         tipo = st.selectbox("Tipo de operación", ["Carga", "Descarga", "Importación", "Exportación"])
         obs = st.text_area("Observación")
 
+    # ✅ NUEVO (solo esto)
+    st.markdown("### Información de registro")
+    registrado_por = st.text_input("Registrado por *")
+    telefono_registro = st.text_input("Teléfono (opcional)")
+
     st.info(f"✅ Quedan **{libres_sel} cupos** en **{turno_sel} ({horario_sel})** para **{fecha_str}**")
 
     if st.button("✅ Generar ticket y registrar"):
         if not placa_tracto or not chofer:
             st.error("Placa tracto y chofer son obligatorios.")
+        elif not registrado_por.strip():
+            st.error("El campo **Registrado por** es obligatorio.")
         else:
             # Verificación final de cupos (por si entran 2 a la vez)
             df_now = read_all(ws)
@@ -300,6 +313,9 @@ with tab_selected[0]:
                     "observacion": safe_str(obs).strip(),
                     "estado": "EN COLA",
                     "creado_en": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    # ✅ NUEVO
+                    "registrado_por": registrado_por.strip(),
+                    "telefono_registro": telefono_registro.strip(),
                 }
                 append_cita(ws, data)
 
@@ -314,7 +330,9 @@ with tab_selected[0]:
                     f"PLACA CARRETA: {data['placa_carreta']}\n"
                     f"CHOFER: {data['chofer_nombre']}\n"
                     f"OPERACIÓN: {data['tipo_operacion']}\n"
-                    f"ESTADO: {data['estado']}\n",
+                    f"ESTADO: {data['estado']}\n"
+                    f"REGISTRADO POR: {data['registrado_por']}\n"
+                    f"TELÉFONO: {data['telefono_registro'] or '-'}\n",
                     language="text",
                 )
 
