@@ -7,8 +7,6 @@ import hashlib
 from io import BytesIO
 import base64
 from pathlib import Path
-import re
-
 import plotly.express as px
 
 # PDF (ticket)
@@ -104,7 +102,7 @@ st.markdown(
         border-right: 1px solid rgba(0,0,0,0.06);
     }}
 
-    /* Inputs con fondo blanco (para que se lean SIEMPRE) */
+    /* Inputs con fondo blanco */
     div[data-baseweb="input"] > div {{
         background: rgba(255,255,255,0.98) !important;
     }}
@@ -136,7 +134,7 @@ st.markdown(
 
 
 def header_brand():
-    # NO mostramos el logo grande arriba (solo en sidebar)
+    # NO mostramos el logo grande arriba
     st.markdown(
         """
         <div style="padding:8px 0 2px 0;">
@@ -150,62 +148,6 @@ def header_brand():
 
 
 # ----------------------------
-# Utilidades
-# ----------------------------
-def safe_str(x):
-    return "" if x is None else str(x)
-
-
-def normalizar_texto(x: str) -> str:
-    s = safe_str(x).strip()
-    if s.startswith("'"):
-        s = s[1:].strip()
-    return s
-
-
-def normalizar_fecha_texto(x: str) -> str:
-    """
-    Acepta:
-      - '2026-02-14
-      - 2026-02-14
-      - 14/02/2026
-    Devuelve YYYY-MM-DD si se puede, o el texto limpio si no.
-    """
-    s = normalizar_texto(x)
-    if not s:
-        return ""
-    # intentos de parse
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-    if pd.isna(dt):
-        return s
-    return dt.strftime("%Y-%m-%d")
-
-
-def extraer_sheet_id(posible_id_o_url: str) -> str:
-    """
-    Soporta:
-      - ID puro
-      - URL completa de Google Sheets
-    """
-    s = safe_str(posible_id_o_url).strip()
-    if not s:
-        return ""
-    # si ya es id (sin '/')
-    if "/" not in s and len(s) > 20:
-        return s
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
-    if m:
-        return m.group(1)
-    # fallback: toma lo más parecido a id
-    m2 = re.search(r"([a-zA-Z0-9-_]{25,})", s)
-    return m2.group(1) if m2 else s
-
-
-def generar_ticket():
-    return "TKT-" + hashlib.sha1(str(datetime.now()).encode()).hexdigest()[:8].upper()
-
-
-# ----------------------------
 # Google Sheets helpers
 # ----------------------------
 @st.cache_resource
@@ -216,28 +158,40 @@ def get_client():
     return gspread.authorize(creds)
 
 
-def ensure_columns(ws):
-    headers = ws.row_values(1)
-    if not headers:
-        ws.append_row(COLUMNAS)
-        return
-
-    missing = [c for c in COLUMNAS if c not in headers]
-    if missing:
-        ws.update("A1", [headers + missing])
-
-
 def get_sheet():
-    raw = st.secrets.get("SHEET_ID", "")
-    sheet_id = extraer_sheet_id(raw)
-    if not sheet_id:
-        raise RuntimeError("Falta SHEET_ID en Secrets (debe ser el ID, no el link).")
+    sheet_id = st.secrets.get("SHEET_ID", "").strip()
+    # IMPORTANTE: aquí debe ir SOLO el ID, no la URL
+    # Ej: 1PXe0YAYrGttH_8AfGZqK64_FtSwJapHI5-_JqChmWXo
+    if (not sheet_id) or ("/" in sheet_id) or ("edit" in sheet_id):
+        raise RuntimeError("SHEET_ID inválido. Debe ser SOLO el ID del spreadsheet (sin URL).")
 
     gc = get_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(WORKSHEET_NAME)
     ensure_columns(ws)
     return ws
+
+
+def ensure_columns(ws):
+    headers = ws.row_values(1)
+    if not headers:
+        ws.append_row(COLUMNAS)
+        return
+    missing = [c for c in COLUMNAS if c not in headers]
+    if missing:
+        ws.update("A1", [headers + missing])
+
+
+def _norm_str(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def _norm_date_text(x) -> str:
+    # Para comparar aunque venga "'2026-02-14" o "2026-02-14"
+    s = _norm_str(x)
+    return s.lstrip("'").strip()
 
 
 def read_all(ws) -> pd.DataFrame:
@@ -250,28 +204,33 @@ def read_all(ws) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
 
-    # NORMALIZAR campos clave para que el cupo funcione aunque venga con "'"
-    df["fecha_cita"] = df["fecha_cita"].apply(normalizar_fecha_texto)
-    df["creado_en"] = df["creado_en"].apply(normalizar_texto)
-    df["telefono_registro"] = df["telefono_registro"].apply(normalizar_texto)
-    df["turno"] = df["turno"].apply(normalizar_texto)
-    df["estado"] = df["estado"].apply(normalizar_texto)
+    # Normalizaciones útiles
+    df["fecha_cita"] = df["fecha_cita"].astype(str).apply(_norm_date_text)
+    df["turno"] = df["turno"].astype(str).apply(_norm_str)
+    df["estado"] = df["estado"].astype(str).apply(_norm_str)
 
     return df[COLUMNAS]
 
 
+def generar_ticket():
+    return "TKT-" + hashlib.sha1(str(datetime.now()).encode()).hexdigest()[:8].upper()
+
+
+def safe_str(x):
+    return "" if x is None else str(x)
+
+
 def append_cita(ws, row_dict: dict):
     """
-    ✅ RAW para que Sheets no convierta fechas/horas a números.
-    ✅ Igual guardamos texto, pero luego normalizamos al leer (para cupos/dashboard).
+    RAW para evitar que Sheets convierta datetimes a números.
     """
     headers = ws.row_values(1)
     row_dict = row_dict.copy()
 
-    # Forzar texto (opcional pero útil)
+    # Mantener texto (por seguridad)
     for k in ["fecha_cita", "creado_en", "telefono_registro"]:
         if k in row_dict and row_dict[k] != "":
-            row_dict[k] = "'" + str(row_dict[k])
+            row_dict[k] = str(row_dict[k]).lstrip("'")  # no duplicar apóstrofes
 
     row = [row_dict.get(h, "") for h in headers]
     ws.append_row(row, value_input_option="RAW")
@@ -318,17 +277,13 @@ def turnos_para_fecha(fecha_dt: date):
 
 
 def cupos_disponibles(df: pd.DataFrame, fecha: str, turno: str, capacidad: int) -> int:
-    """
-    Cuenta todo menos CANCELADO.
-    """
     if df.empty:
         return capacidad
+    fecha = _norm_date_text(fecha)
+    turno = _norm_str(turno)
 
-    fecha = normalizar_fecha_texto(fecha)
-    turno = normalizar_texto(turno)
-
-    sub = df[(df["fecha_cita"] == fecha) & (df["turno"] == turno)]
-    sub = sub[sub["estado"] != "CANCELADO"]
+    sub = df[(df["fecha_cita"].astype(str).apply(_norm_date_text) == fecha) & (df["turno"].astype(str).apply(_norm_str) == turno)]
+    sub = sub[sub["estado"] != "CANCELADO"]  # cancelados no consumen cupo
     usados = len(sub)
     return max(0, capacidad - usados)
 
@@ -343,100 +298,145 @@ def turnos_disponibles(df: pd.DataFrame, fecha_dt: date, fecha_str: str):
 
 
 # ----------------------------
-# PDF Ticket (PRO con logo + fondo)
+# PDF Ticket (PRO con logo + fondo)  ✅ LOGO CORREGIDO
 # ----------------------------
 def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
     buffer = BytesIO()
     c = canvas.Canvas(buffer, pagesize=A6)
     width, height = A6
 
-    # Fondo (más visible)
+    # 1) Fondo
     if FONDO_PATH.exists():
         try:
-            c.saveState()
-            c.setFillAlpha(1)
             c.drawImage(ImageReader(str(FONDO_PATH)), 0, 0, width=width, height=height, mask="auto")
-            c.restoreState()
         except Exception:
             pass
 
-    # Tarjeta blanca redondeada (overlay)
-    card_x, card_y = 12, 12
-    card_w, card_h = width - 24, height - 24
+    # 2) Tarjeta blanca con bordes redondeados (simulada)
+    margin = 10
+    card_x = margin
+    card_y = margin
+    card_w = width - 2 * margin
+    card_h = height - 2 * margin
+
+    # “sombra” ligera
+    try:
+        c.saveState()
+        c.setFillColor(colors.black)
+        c.setFillAlpha(0.08)
+        c.roundRect(card_x + 2, card_y - 2, card_w, card_h, 12, fill=1, stroke=0)
+        c.restoreState()
+    except Exception:
+        pass
+
+    # tarjeta blanca
     try:
         c.saveState()
         c.setFillColor(colors.white)
-        c.setFillAlpha(0.88)
+        c.setFillAlpha(0.90)
         c.roundRect(card_x, card_y, card_w, card_h, 12, fill=1, stroke=0)
         c.restoreState()
     except Exception:
-        c.setFillColorRGB(1, 1, 1)
+        c.setFillColor(colors.white)
         c.roundRect(card_x, card_y, card_w, card_h, 12, fill=1, stroke=0)
 
-    # Logo (arriba izquierda)
+    # 3) Header: logo + título sin chocar
+    header_top = height - margin - 10
+    header_h = 42
+    header_y = header_top - header_h
+
+    # Logo (ajuste proporcional)
+    logo_drawn_w = 0
     if LOGO_PATH.exists():
         try:
-            c.drawImage(ImageReader(str(LOGO_PATH)), card_x + 8, height - 55, width=110, height=35, mask="auto")
-        except Exception:
-            pass
+            img = ImageReader(str(LOGO_PATH))
+            iw, ih = img.getSize()
 
-    # Título centrado
+            max_w = 120
+            max_h = 34
+            scale = min(max_w / float(iw), max_h / float(ih))
+
+            lw = iw * scale
+            lh = ih * scale
+
+            lx = card_x + 12
+            ly = header_y + (header_h - lh) / 2
+
+            c.drawImage(img, lx, ly, width=lw, height=lh, mask="auto")
+            logo_drawn_w = lw + 10
+        except Exception:
+            logo_drawn_w = 0
+
+    # Título centrado (o corrido si hay logo)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 12)
-    c.drawCentredString(width / 2, height - 28, "TICKET DE CITA")
+
+    title = "TICKET DE CITA"
+    title_y = header_y + header_h / 2 + 6
+
+    # si hay logo, centramos título en el espacio restante
+    left_limit = card_x + 12 + logo_drawn_w
+    right_limit = card_x + card_w - 12
+    available_w = max(10, right_limit - left_limit)
+
+    title_w = c.stringWidth(title, "Helvetica-Bold", 12)
+    if title_w <= available_w:
+        tx = left_limit + (available_w - title_w) / 2
+    else:
+        tx = left_limit
+
+    c.drawString(tx, title_y, title)
+
+    # Línea separadora bajo header
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(0.8)
+    c.line(card_x + 12, header_y - 2, card_x + card_w - 12, header_y - 2)
+
+    # 4) Cuerpo (dos columnas tipo “Ticket: valor”)
+    y = header_y - 16
+    label_x = card_x + 16
+    value_x = card_x + 92
+
+    c.setFont("Helvetica-Bold", 9.5)
+
+    def row(lbl: str, val: str):
+        nonlocal y
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawString(label_x, y, f"{lbl}:")
+        c.setFont("Helvetica", 9.5)
+        c.drawString(value_x, y, safe_str(val))
+        y -= 13
+
+    row("Ticket", ticket_data.get("id_ticket", ""))
+    row("Fecha", ticket_data.get("fecha_cita", ""))
+    row("Turno", f"{ticket_data.get('turno','')} ({ticket_data.get('horario_turno','')})")
+    row("Placa tracto", ticket_data.get("placa_tracto", ""))
+    row("Placa carreta", ticket_data.get("placa_carreta", ""))
+    row("Chofer", ticket_data.get("chofer_nombre", ""))
+    row("Licencia", ticket_data.get("licencia", ""))
+    row("Transporte", ticket_data.get("transporte", ""))
+    row("Operación", ticket_data.get("tipo_operacion", ""))
+    row("Estado", ticket_data.get("estado", ""))
+    row("Registrado por", ticket_data.get("registrado_por", ""))
+    row("Teléfono", ticket_data.get("telefono_registro", ""))
 
     # Línea separadora
-    c.setStrokeColor(colors.black)
-    c.setLineWidth(1)
-    c.line(card_x + 10, height - 62, width - (card_x + 10), height - 62)
-
-    # Contenido en 2 columnas (etiqueta/valor)
-    left_x = card_x + 16
-    label_x = left_x
-    value_x = left_x + 72
-    y = height - 82
-
-    c.setFont("Helvetica-Bold", 9.6)
-    labels = [
-        ("Ticket:", ticket_data.get("id_ticket", "")),
-        ("Fecha:", ticket_data.get("fecha_cita", "")),
-        ("Turno:", f"{ticket_data.get('turno','')} ({ticket_data.get('horario_turno','')})"),
-        ("Placa tracto:", ticket_data.get("placa_tracto", "")),
-        ("Placa carreta:", ticket_data.get("placa_carreta", "")),
-        ("Chofer:", ticket_data.get("chofer_nombre", "")),
-        ("Licencia:", ticket_data.get("licencia", "")),
-        ("Transporte:", ticket_data.get("transporte", "")),
-        ("Operación:", ticket_data.get("tipo_operacion", "")),
-        ("Estado:", ticket_data.get("estado", "")),
-        ("Registrado por:", ticket_data.get("registrado_por", "")),
-        ("Teléfono:", ticket_data.get("telefono_registro", "")),
-    ]
-
-    c.setFillColor(colors.black)
-    for lab, val in labels:
-        c.setFont("Helvetica-Bold", 9.6)
-        c.drawString(label_x, y, lab)
-        c.setFont("Helvetica", 9.6)
-        c.drawString(value_x, y, safe_str(val))
-        y -= 14
-
-    # Línea separadora + IMPORTANT
-    y -= 2
-    c.setStrokeColor(colors.black)
-    c.setLineWidth(1)
-    c.line(card_x + 10, y, width - (card_x + 10), y)
+    c.setLineWidth(0.8)
+    c.line(card_x + 12, y - 2, card_x + card_w - 12, y - 2)
     y -= 18
 
+    # IMPORTANTE
     c.setFont("Helvetica-Bold", 10)
     c.drawString(label_x, y, "IMPORTANTE:")
-    y -= 14
-    c.setFont("Helvetica", 9.6)
+    y -= 12
+    c.setFont("Helvetica", 10)
     c.drawString(label_x, y, "Presentarse 30 minutos antes de su cita.")
 
-    # Footer
+    # footer
+    creado = ticket_data.get("creado_en", "")
+    creado = safe_str(creado).split(".")[0]
     c.setFont("Helvetica-Oblique", 8.5)
-    generado = datetime.now().strftime("%Y-%m-%d %H:%M")
-    c.drawString(card_x + 12, card_y + 10, f"Generado: {generado}")
+    c.drawString(label_x, card_y + 10, f"Generado: {creado}")
 
     c.showPage()
     c.save()
@@ -475,7 +475,7 @@ except Exception:
     st.error("No se pudo conectar a Google Sheets. Revisa permisos del Service Account y el SHEET_ID.")
     st.stop()
 
-# Session state para que NO se borre el resumen y SI salga el PDF
+# Estado para mantener resumen + pdf (evita que se borre)
 if "last_ticket_data" not in st.session_state:
     st.session_state["last_ticket_data"] = None
 if "last_pdf_bytes" not in st.session_state:
@@ -486,9 +486,10 @@ if "last_pdf_bytes" not in st.session_state:
 # TAB 1: Registro
 # ----------------------------
 with tab_selected[0]:
-    df = read_all(ws)
-
     st.subheader("Registro (Chofer)")
+
+    # Leer siempre fresco
+    df = read_all(ws)
 
     hoy = date.today()
     _, days = semana_lun_sab(hoy)
@@ -523,7 +524,11 @@ with tab_selected[0]:
     registrado_por = st.text_input("Registrado por *")
     telefono_registro = st.text_input("Teléfono (opcional)")
 
-    st.info(f"✅ Quedan **{libres_sel} cupos** en **{turno_sel} ({horario_sel})** para **{fecha_str}**")
+    # Recalcular cupos “en vivo” con data fresca
+    df_now_for_cupos = read_all(ws)
+    libres_live = cupos_disponibles(df_now_for_cupos, fecha_str, turno_sel, cap_sel)
+
+    st.info(f"✅ Quedan **{libres_live} cupos** en **{turno_sel} ({horario_sel})** para **{fecha_str}**")
 
     if st.button("✅ Generar ticket y registrar"):
         if not placa_tracto or not chofer:
@@ -531,7 +536,7 @@ with tab_selected[0]:
         elif not registrado_por.strip():
             st.error("El campo **Registrado por** es obligatorio.")
         else:
-            # Releer justo antes de guardar (anti colisión)
+            # validar cupo justo antes de registrar
             df_now = read_all(ws)
             libres_now = cupos_disponibles(df_now, fecha_str, turno_sel, cap_sel)
             if libres_now <= 0:
@@ -559,41 +564,37 @@ with tab_selected[0]:
 
                 append_cita(ws, data)
 
-                # Guardar para mostrar después del rerun
+                # Guardar en session_state para que NO se borre
                 st.session_state["last_ticket_data"] = data
                 st.session_state["last_pdf_bytes"] = make_ticket_pdf_bytes(data)
 
-                # Rerun para refrescar cupos/turnos, pero SIN perder resumen
-                st.rerun()
+                st.success(f"🎟️ Ticket creado: **{ticket}**")
 
-    # Mostrar el último ticket si existe (no se borra)
+    # Mostrar resumen + PDF SIEMPRE que exista (aunque se recargue la página)
     if st.session_state["last_ticket_data"]:
-        data = st.session_state["last_ticket_data"]
-        st.success(f"🎟️ Ticket creado: **{data['id_ticket']}**")
-
+        d = st.session_state["last_ticket_data"]
         st.code(
-            f"TICKET: {data['id_ticket']}\n"
-            f"FECHA: {data['fecha_cita']}\n"
-            f"TURNO: {data['turno']} ({data['horario_turno']})\n"
-            f"PLACA TRACTO: {data['placa_tracto']}\n"
-            f"PLACA CARRETA: {data['placa_carreta']}\n"
-            f"CHOFER: {data['chofer_nombre']}\n"
-            f"LICENCIA: {data['licencia']}\n"
-            f"TRANSPORTE: {data['transporte']}\n"
-            f"OPERACIÓN: {data['tipo_operacion']}\n"
-            f"ESTADO: {data['estado']}\n"
-            f"REGISTRADO POR: {data['registrado_por']}\n"
-            f"TELÉFONO: {data['telefono_registro'] or '-'}\n",
+            f"TICKET: {d.get('id_ticket','')}\n"
+            f"FECHA: {d.get('fecha_cita','')}\n"
+            f"TURNO: {d.get('turno','')} ({d.get('horario_turno','')})\n"
+            f"PLACA TRACTO: {d.get('placa_tracto','')}\n"
+            f"PLACA CARRETA: {d.get('placa_carreta','')}\n"
+            f"CHOFER: {d.get('chofer_nombre','')}\n"
+            f"LICENCIA: {d.get('licencia','')}\n"
+            f"TRANSPORTE: {d.get('transporte','')}\n"
+            f"OPERACIÓN: {d.get('tipo_operacion','')}\n"
+            f"ESTADO: {d.get('estado','')}\n"
+            f"REGISTRADO POR: {d.get('registrado_por','')}\n"
+            f"TELÉFONO: {d.get('telefono_registro','') or '-'}\n",
             language="text",
         )
 
-        if st.session_state["last_pdf_bytes"]:
-            st.download_button(
-                "⬇️ Descargar ticket (PDF)",
-                data=st.session_state["last_pdf_bytes"],
-                file_name=f"{data['id_ticket']}.pdf",
-                mime="application/pdf",
-            )
+        st.download_button(
+            "⬇️ Descargar ticket (PDF)",
+            data=st.session_state["last_pdf_bytes"],
+            file_name=f"{d.get('id_ticket','TICKET')}.pdf",
+            mime="application/pdf",
+        )
 
 
 # ----------------------------
@@ -663,14 +664,13 @@ if admin_ok:
 if admin_ok:
     with tab_selected[2]:
         df = read_all(ws)
-
         st.subheader("Dashboard (Gerencia)")
 
         df_dash = df.copy()
 
-        # Parse robusto
+        # parse robusto de fechas
         df_dash["fecha_cita_dt"] = pd.to_datetime(
-            df_dash["fecha_cita"].astype(str),
+            df_dash["fecha_cita"].astype(str).apply(_norm_date_text),
             errors="coerce",
             dayfirst=True,
         ).dt.date
