@@ -133,8 +133,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 def header_brand():
-    # 👇 IMPORTANTE: NO mostramos el logo grande arriba (para quitar el “logo del círculo”)
+    # NO mostramos el logo grande arriba
     st.markdown(
         """
         <div style="padding:8px 0 2px 0;">
@@ -148,6 +149,28 @@ def header_brand():
 
 
 # ----------------------------
+# Normalización de fechas (CLAVE para cupos y dashboard)
+# ----------------------------
+def normalize_fecha_str(s) -> str:
+    """
+    Convierte cualquier formato que venga de Sheets a 'YYYY-MM-DD'
+    - quita apostrofes iniciales (')
+    - soporta 'YYYY-MM-DD', 'DD/MM/YYYY', 'D/M/YYYY', etc.
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    if s.startswith("'"):
+        s = s[1:].strip()
+
+    # intentamos parsear
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return s  # si no se pudo, lo dejamos como está
+    return dt.strftime("%Y-%m-%d")
+
+
+# ----------------------------
 # Google Sheets helpers
 # ----------------------------
 @st.cache_resource
@@ -156,6 +179,7 @@ def get_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
+
 
 def get_sheet():
     sheet_id = st.secrets.get("SHEET_ID", "")
@@ -167,6 +191,7 @@ def get_sheet():
     ensure_columns(ws)
     return ws
 
+
 def ensure_columns(ws):
     headers = ws.row_values(1)
     if not headers:
@@ -176,6 +201,7 @@ def ensure_columns(ws):
     missing = [c for c in COLUMNAS if c not in headers]
     if missing:
         ws.update("A1", [headers + missing])
+
 
 def read_all(ws) -> pd.DataFrame:
     data = ws.get_all_records()
@@ -188,29 +214,39 @@ def read_all(ws) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
 
+    # normalizar fecha_cita para comparaciones
+    df["fecha_cita"] = df["fecha_cita"].apply(normalize_fecha_str)
+
     return df[COLUMNAS]
+
 
 def generar_ticket():
     return "TKT-" + hashlib.sha1(str(datetime.now()).encode()).hexdigest()[:8].upper()
 
+
 def safe_str(x):
     return "" if x is None else str(x)
 
+
 def append_cita(ws, row_dict: dict):
     """
-    ✅ CLAVE:
     - RAW para que Google Sheets NO convierta datetime a números (46065...)
     - Apostrofe en fecha/creado_en para forzar TEXTO
     """
     headers = ws.row_values(1)
     row_dict = row_dict.copy()
 
-    for k in ["fecha_cita", "creado_en", "telefono_registro"]:
-        if k in row_dict and row_dict[k] != "":
-            row_dict[k] = "'" + str(row_dict[k])
+    # Guardamos consistente en ISO y forzamos texto
+    if "fecha_cita" in row_dict and row_dict["fecha_cita"]:
+        row_dict["fecha_cita"] = "'" + normalize_fecha_str(row_dict["fecha_cita"])
+    if "creado_en" in row_dict and row_dict["creado_en"]:
+        row_dict["creado_en"] = "'" + str(row_dict["creado_en"])
+    if "telefono_registro" in row_dict and row_dict["telefono_registro"]:
+        row_dict["telefono_registro"] = "'" + str(row_dict["telefono_registro"])
 
     row = [row_dict.get(h, "") for h in headers]
     ws.append_row(row, value_input_option="RAW")
+
 
 def update_estado_por_row(ws, row_number: int, nuevo_estado: str):
     headers = ws.row_values(1)
@@ -226,13 +262,16 @@ def update_estado_por_row(ws, row_number: int, nuevo_estado: str):
 def lunes_de_semana(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
+
 def semana_lun_sab(d: date):
     start = lunes_de_semana(d)
     days = [start + timedelta(days=i) for i in range(6)]  # lunes..sábado
     return start, days
 
+
 def fmt_fecha(d: date) -> str:
     return d.strftime("%Y-%m-%d")
+
 
 def nombre_dia_es(d: date) -> str:
     dias = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
@@ -243,18 +282,24 @@ def nombre_dia_es(d: date) -> str:
 # Turnos / cupos
 # ----------------------------
 def turnos_para_fecha(fecha_dt: date):
-    # ✅ Sábado (weekday 5) solo 2 turnos
+    # Sábado (weekday 5) solo 2 turnos
     if fecha_dt.weekday() == 5:
         return TURNOS_BASE[:2]
     return TURNOS_BASE
 
+
 def cupos_disponibles(df: pd.DataFrame, fecha: str, turno: str, capacidad: int) -> int:
     if df.empty:
         return capacidad
-    sub = df[(df["fecha_cita"].astype(str) == fecha) & (df["turno"] == turno)]
-    sub = sub[sub["estado"] != "CANCELADO"]
+
+    fecha_norm = normalize_fecha_str(fecha)
+
+    # ✅ CLAVE: fecha_cita ya viene normalizada desde read_all()
+    sub = df[(df["fecha_cita"] == fecha_norm) & (df["turno"] == turno)]
+    sub = sub[sub["estado"] != "CANCELADO"]  # cancelados no consumen cupo
     usados = len(sub)
     return max(0, capacidad - usados)
+
 
 def turnos_disponibles(df: pd.DataFrame, fecha_dt: date, fecha_str: str):
     opciones = []
@@ -336,7 +381,7 @@ def make_ticket_pdf_bytes(ticket_data: dict) -> bytes:
 # ----------------------------
 header_brand()
 
-# ✅ Logo SOLO en sidebar (como pediste)
+# Logo SOLO en sidebar (como pediste)
 if LOGO_PATH.exists():
     st.sidebar.image(str(LOGO_PATH), use_container_width=True)
 
@@ -358,17 +403,22 @@ tab_selected = st.tabs(tabs)
 # Conectar sheet
 try:
     ws = get_sheet()
-except Exception as e:
+except Exception:
     st.error("No se pudo conectar a Google Sheets. Revisa permisos del Service Account y el SHEET_ID.")
     st.stop()
+
+# Session state para que el PDF NO desaparezca con rerun()
+if "last_ticket" not in st.session_state:
+    st.session_state["last_ticket"] = ""
+if "last_pdf" not in st.session_state:
+    st.session_state["last_pdf"] = None
 
 
 # ----------------------------
 # TAB 1: Registro
 # ----------------------------
 with tab_selected[0]:
-    # Leer siempre “fresco”
-    df = read_all(ws)
+    df = read_all(ws)  # leer fresco
 
     st.subheader("Registro (Chofer)")
 
@@ -437,20 +487,25 @@ with tab_selected[0]:
                     "registrado_por": registrado_por.strip(),
                     "telefono_registro": telefono_registro.strip(),
                 }
+
                 append_cita(ws, data)
+
+                # Guardar PDF para que no desaparezca con rerun
+                st.session_state["last_ticket"] = ticket
+                st.session_state["last_pdf"] = make_ticket_pdf_bytes(data)
 
                 st.success(f"🎟️ Ticket creado: **{ticket}**")
 
-                pdf_bytes = make_ticket_pdf_bytes(data)
-                st.download_button(
-                    "⬇️ Descargar ticket (PDF)",
-                    data=pdf_bytes,
-                    file_name=f"{ticket}.pdf",
-                    mime="application/pdf",
-                )
-
-                # ✅ Para que todo se refresque (y dashboard vea el nuevo registro)
                 st.rerun()
+
+    # ✅ Siempre mostrar el PDF si existe (aunque se haya hecho rerun)
+    if st.session_state.get("last_pdf"):
+        st.download_button(
+            "⬇️ Descargar ticket (PDF)",
+            data=st.session_state["last_pdf"],
+            file_name=f"{st.session_state.get('last_ticket','ticket')}.pdf",
+            mime="application/pdf",
+        )
 
 
 # ----------------------------
@@ -525,7 +580,6 @@ if admin_ok:
 
         df_dash = df.copy()
 
-        # ✅ MUY IMPORTANTE: parsea fecha aunque venga como 12/2/2026
         df_dash["fecha_cita_dt"] = pd.to_datetime(
             df_dash["fecha_cita"].astype(str),
             errors="coerce",
